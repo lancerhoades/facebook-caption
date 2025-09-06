@@ -5,7 +5,6 @@ import subprocess
 import requests
 import runpod
 import boto3
-
 from botocore.config import Config
 
 print("RunPod worker starting…", flush=True)
@@ -14,6 +13,7 @@ print("RunPod worker starting…", flush=True)
 S3_ENDPOINT = "https://s3api-us-ks-2.runpod.io"
 S3_BUCKET = "cqk82s22rj"
 S3_REGION = "us-ks-2"
+URL_TTL_SECONDS = int(os.getenv("URL_TTL_SECONDS", "86400"))  # 24h default
 
 # Expect your access keys in env vars (set them in RunPod dashboard)
 S3_KEY = os.getenv("S3_ACCESS_KEY")
@@ -25,9 +25,9 @@ s3 = boto3.client(
     aws_access_key_id=S3_KEY,
     aws_secret_access_key=S3_SECRET,
     region_name=S3_REGION,
-    config=Config(signature_version="s3v4", s3={"addressing_style":"path"}),
+    # SigV4 only; (no addressing override)
+    config=Config(signature_version="s3v4"),
 )
-
 
 def handler(event):
     inp = event.get("input", {})
@@ -37,13 +37,13 @@ def handler(event):
     if not video_url:
         return {"error": "video_url is required"}
 
-    # temp workspace
     with tempfile.TemporaryDirectory() as td:
         in_mp4 = os.path.join(td, "input.mp4")
+        # keep also writing to the mounted volume for persistence
         out_mp4 = os.path.join("/runpod-volume", out_name)
 
         try:
-            # Download video
+            # Download source
             with requests.get(video_url, stream=True, timeout=300) as r:
                 r.raise_for_status()
                 with open(in_mp4, "wb") as f:
@@ -51,7 +51,7 @@ def handler(event):
                         if chunk:
                             f.write(chunk)
 
-            # Run your captioning script
+            # Run caption job
             proc = subprocess.run(
                 ["python", "/app/caption.py", in_mp4, "--output", out_mp4],
                 check=True,
@@ -62,16 +62,29 @@ def handler(event):
             if not os.path.exists(out_mp4):
                 return {"error": "caption.py completed but no output file found."}
 
-            # Upload to RunPod S3 volume
-            s3.upload_file(out_mp4, S3_BUCKET, out_name, ExtraArgs={"ContentType":"video/mp4"})
+            # Upload to RunPod S3 volume (no ACLs; gateway doesn’t support x-amz-acl)
+            s3.upload_file(
+                out_mp4, S3_BUCKET, out_name,
+                ExtraArgs={"ContentType": "video/mp4"}
+            )
 
-            file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
+            # Presigned (was previously working from the worker’s POV)
+            presigned_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": out_name},
+                ExpiresIn=URL_TTL_SECONDS,
+            )
+
+            # Also return plain path-style for reference (may be 403 until bucket policy allows it)
+            plain_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
 
             return {
                 "status": "ok",
-                "file_url": file_url,
+                "file_url": presigned_url,
+                "plain_url": plain_url,
+                "s3_key": out_name,
                 "size_bytes": os.path.getsize(out_mp4),
-                "stdout": proc.stdout[-1000:],  # tail logs for debug
+                "stdout": proc.stdout[-1000:],
             }
 
         except subprocess.CalledProcessError as e:
@@ -84,6 +97,4 @@ def handler(event):
         except Exception as e:
             return {"error": f"runtime_error: {e.__class__.__name__}: {e}"}
 
-
-# Start RunPod worker
 runpod.serverless.start({"handler": handler})
