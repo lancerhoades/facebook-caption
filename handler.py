@@ -1,27 +1,28 @@
-import runpod
+# handler.py
+import os
 import subprocess
+import runpod
 
 def handler(event):
     inp = event.get("input", {})
     video_url = inp.get("video_url")
+    out_name = inp.get("output_name", "output-captioned.mp4")
+
     if not video_url:
         return {"error": "video_url is required"}
 
-    out_name = inp.get("output_name", "output-captioned.mp4")
+    in_mp4 = "/tmp/input.mp4"
+    out_mp4 = f"/tmp/{out_name}"
 
-    # Download input video
-    subprocess.run(["wget", "-O", "input.mp4", video_url], check=True)
+    # download video
+    subprocess.run(["wget", "-O", in_mp4, video_url], check=True)
 
-    # Run your existing caption script
-    subprocess.run(["python", "caption.py", "input.mp4", "--output", out_name], check=True)
+    # run your existing caption script
+    subprocess.run(["python", "/app/caption.py", in_mp4, "--output", out_mp4], check=True)
 
-    # Upload result to transfer.sh for a download link
-    url = subprocess.check_output(
-        ["curl", "--silent", "--upload-file", out_name, f"https://transfer.sh/{out_name}"],
-        text=True
-    ).strip()
+    # for now, just return metadata (later you can upload to S3/Drive and return a URL)
+    size = os.path.getsize(out_mp4)
+    return {"status": "ok", "output_path": out_mp4, "size_bytes": size}
 
-    return {"status": "done", "download_url": url, "output_file": out_name}
-
-# Important: RunPod entrypoint
+# >>> THIS LINE STARTS THE WORKER <<<
 runpod.serverless.start({"handler": handler})
