@@ -25,7 +25,7 @@ s3 = boto3.client(
     aws_access_key_id=S3_KEY,
     aws_secret_access_key=S3_SECRET,
     region_name=S3_REGION,
-    config=Config(signature_version="s3v4", s3={"addressing_style":"virtual"}),
+    config=Config(signature_version="s3v4", s3={"addressing_style":"path"}),
 )
 
 
