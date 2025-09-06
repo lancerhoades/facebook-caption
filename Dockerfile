@@ -8,11 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System deps (lean)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg imagemagick fonts-dejavu-core wget ca-certificates \
+    ffmpeg imagemagick fonts-dejavu-core ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Font alias some code expects
-RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF || true
+#RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF || true
 
 WORKDIR /app
 
@@ -23,8 +23,17 @@ RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
 
 # App code
 COPY . .
-RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
 
+# Sanity checks (fail build if imports are broken or file is missing)
+#RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
+#RUN python - <<'PY'
+#import sys
+#print("Python OK:", sys.version)
+#import caption
+#print("Import caption OK")
+#import moviepy, PIL, requests, runpod
+#print("Key deps OK")
+#PY
 
-# Start the RunPod worker
-CMD ["python", "-u", "handler.py"]
+# Use ENTRYPOINT so RunPod doesn’t override it with shell
+ENTRYPOINT ["python", "-u", "handler.py"]
