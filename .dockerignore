@@ -32,3 +32,4 @@ node_modules/
 # Build dists
 build/
 dist/
+facebook-caption/
