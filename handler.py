@@ -37,7 +37,7 @@ def handler(event):
     # temp workspace
     with tempfile.TemporaryDirectory() as td:
         in_mp4 = os.path.join(td, "input.mp4")
-        out_mp4 = os.path.join(td, out_name)
+        out_mp4 = os.path.join("/runpod-volume", out_name)
 
         try:
             # Download video
