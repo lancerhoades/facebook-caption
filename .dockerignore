@@ -1,5 +1,7 @@
 # .dockerignore
 .git
+.github
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -9,6 +11,8 @@ __pycache__/
 
 # Large media/artifacts
 *.mp4
+*.wav
+*.mp3
 transcripts/
 
 # OS/editor junk
