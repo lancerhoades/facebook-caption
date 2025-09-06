@@ -1,0 +1,16 @@
+# .dockerignore
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tar
+*.gz
+
+# Large media/artifacts
+*.mp4
+transcripts/
+
+# OS/editor junk
+.DS_Store
+*.swp
