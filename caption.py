@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydub import AudioSegment
 from openai import OpenAI
+import os
+os.environ["IMAGEMAGICK_BINARY"]="/usr/bin/convert"
 from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
 from moviepy.video.VideoClip import ColorClip
 
