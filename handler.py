@@ -12,9 +12,12 @@ def handler(event):
     subprocess.run(["wget", "-O", "input.mp4", video_url], check=True)
 
     # Run your existing caption script
+    # Requires OPENAI_API_KEY in the environment (set in RunPod Endpoint)
     subprocess.run(["python", "caption.py", "input.mp4", "--output", out_name], check=True)
 
-    # TODO: upload out_name to cloud storage and return a URL
-    return {"status": "done", "output": out_name}
+    # Upload result to transfer.sh to get a quick shareable link
+    url = subprocess.check_output(["curl", "--silent", "--upload-file", out_name, f"https://transfer.sh/{out_name}"], text=True).strip()
+
+    return {"status": "done", "download_url": url, "output_file": out_name}
 
 runpod.serverless.start({"handler": handler})
