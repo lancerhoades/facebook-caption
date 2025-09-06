@@ -1,4 +1,3 @@
-# handler.py
 import os
 import subprocess
 import runpod
@@ -14,15 +13,16 @@ def handler(event):
     in_mp4 = "/tmp/input.mp4"
     out_mp4 = f"/tmp/{out_name}"
 
-    # download video
-    subprocess.run(["wget", "-O", in_mp4, video_url], check=True)
+    # Download input video
+    subprocess.run(["wget", "-q", "-O", in_mp4, video_url], check=True)
 
-    # run your existing caption script
+    # Run your existing script
+    # NOTE: caption.py reads OPENAI_API_KEY from env
     subprocess.run(["python", "/app/caption.py", in_mp4, "--output", out_mp4], check=True)
 
-    # for now, just return metadata (later you can upload to S3/Drive and return a URL)
+    # For now return metadata; later we can upload to S3/Drive and return a public URL
     size = os.path.getsize(out_mp4)
     return {"status": "ok", "output_path": out_mp4, "size_bytes": size}
 
-# >>> THIS LINE STARTS THE WORKER <<<
+# >>> START THE WORKER <<<
 runpod.serverless.start({"handler": handler})

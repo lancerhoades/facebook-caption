@@ -1,24 +1,26 @@
 FROM python:3.11-slim
 
-# System deps: ffmpeg for audio/video, imagemagick for MoviePy TextClip "caption" method, curl for uploading
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg imagemagick curl fonts-dejavu-core \
+    ffmpeg imagemagick fonts-dejavu-core wget curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Provide a font at the exact path your script expects
-# Your caption.py uses: /usr/local/share/fonts/MREARLN.TTF
-# We'll symlink DejaVuSans-Bold there so it doesn't break.
-RUN mkdir -p /usr/local/share/fonts && \
-    ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF
+# Font for MoviePy TextClip (your code expects this path)
+RUN mkdir -p /usr/local/share/fonts \
+ && ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF
 
-# Python deps
+WORKDIR /app
+
+# Install Python deps first (cache-friendly)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy code
-WORKDIR /app
+# App code
 COPY . /app
 
-# RunPod serverless will start via handler.py
+# Helpful for ImageMagick detection by moviepy
+ENV IMAGEMAGICK_BINARY=convert
 ENV PYTHONUNBUFFERED=1
+
+# Start the RunPod worker
 CMD ["python", "-u", "handler.py"]
