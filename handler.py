@@ -65,8 +65,7 @@ def handler(event):
             # Upload to RunPod S3 volume
             s3.upload_file(out_mp4, S3_BUCKET, out_name, ExtraArgs={"ContentType":"video/mp4","ACL":"public-read"})
 
-            file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"))
-            file_url = file_url
+            file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
 
             return {
                 "status": "ok",
