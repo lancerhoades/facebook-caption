@@ -1,0 +1,5 @@
+moviepy==1.0.3
+pydub
+openai
+ffmpeg-python
+runpod
