@@ -63,7 +63,7 @@ def handler(event):
                 return {"error": "caption.py completed but no output file found."}
 
             # Upload to RunPod S3 volume
-            s3.upload_file(out_mp4, S3_BUCKET, out_name, ExtraArgs={"ContentType":"video/mp4","ACL":"public-read"})
+            s3.upload_file(out_mp4, S3_BUCKET, out_name, ExtraArgs={"ContentType":"video/mp4"})
 
             file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
 
