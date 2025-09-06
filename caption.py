@@ -6,8 +6,9 @@ from pathlib import Path
 
 from pydub import AudioSegment
 from openai import OpenAI
-os.environ["IMAGEMAGICK_BINARY"] = "/usr/bin/convert"
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
 
 # --- Configuration ---
 MAX_CHUNK_SIZE = 24 * 1024 * 1024  # 24 MB
@@ -19,6 +20,8 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("Please set the OPENAI_API_KEY environment variable")
 client = OpenAI(api_key=api_key)
+
+# ---------- Audio helpers ----------
 
 def extract_audio(video_path: Path, wav_path: Path):
     cmd = [
@@ -58,20 +61,18 @@ def split_audio(wav_path: Path):
 
     return chunks
 
+# ---------- Transcription ----------
+
 def _supports_verbose_json(model: str) -> bool:
     # whisper-1 supports verbose_json (words/segments). 4o-transcribe models do not.
     return model == "whisper-1"
 
 def _evenly_time_words(text: str, chunk_seconds: float, offset: float):
-    """
-    For models that don't return word timestamps, approximate them by
-    distributing words evenly across the chunk duration.
-    """
+    """Approximate per-word timings by distributing evenly across the chunk."""
     tokens = re.findall(r"[A-Za-z0-9']+|-+", text)
     tokens = [t for t in tokens if t.strip()]
     if not tokens or chunk_seconds <= 0:
         return []
-
     per_word = chunk_seconds / len(tokens)
     out = []
     for i, tok in enumerate(tokens):
@@ -86,7 +87,6 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
     for path, offset in chunks:
         print(f"[INFO] Transcribing {path.name} (offset {offset:.2f}s) with model={model}")
         with open(path, "rb") as af:
-            # Choose response_format based on model capabilities
             if verbose:
                 resp = client.audio.transcriptions.create(
                     file=af,
@@ -107,14 +107,12 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
         print("[DEBUG] Raw transcription response keys:", list(data.keys()))
 
         if verbose:
-            # Prefer top-level words; fall back to segments[].words if present
             wl = data.get("words") or [
                 w for seg in (data.get("segments") or [])
                 for w in (seg.get("words") or [])
             ]
             if not wl:
-                print("[WARN] verbose_json contained no word timestamps; falling back to segment spans.")
-                # Fallback: approximate across full chunk if only 'text' exists
+                print("[WARN] verbose_json contained no word timestamps; approximating.")
                 chunk_len_s = AudioSegment.from_wav(str(path)).duration_seconds
                 wl = _evenly_time_words(data.get("text", ""), chunk_len_s, 0.0)
             for w in wl:
@@ -125,7 +123,6 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
                         "word": str(w["word"])
                     })
         else:
-            # 4o-transcribe family: JSON without timestamps. Approximate evenly.
             text = data.get("text", "") or ""
             chunk_len_s = AudioSegment.from_wav(str(path)).duration_seconds
             approx = _evenly_time_words(text, chunk_len_s, offset)
@@ -135,6 +132,8 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
 
     print(f"[INFO] Total words collected: {len(words)}")
     return sorted(words, key=lambda x: x["start"])
+
+# ---------- Grouping ----------
 
 def group_into_segments(words, max_chars=32):
     segments = []
@@ -166,43 +165,119 @@ def group_into_segments(words, max_chars=32):
     print(f"[INFO] Total segments: {len(segments)}")
     return segments
 
+# ---------- Caption drawing (Pillow) ----------
+
+_FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    """
+    Load preferred TTF; fallback to DejaVuSans available in Debian slim images.
+    """
+    candidates = [
+        "/usr/local/share/fonts/MREARLN.TTF",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            key = (p, font_size)
+            if key not in _FONT_CACHE:
+                _FONT_CACHE[key] = ImageFont.truetype(p, font_size)
+            return _FONT_CACHE[key]
+    # Last resort: PIL default bitmap font (no size scaling)
+    return ImageFont.load_default()
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int):
+    """
+    Simple greedy wrap by words to fit max_width. Returns list of lines and max line width.
+    """
+    words = text.split()
+    lines = []
+    cur = []
+    max_w = 0
+    for w in words:
+        trial = (" ".join(cur + [w])).strip()
+        w_box = draw.textbbox((0, 0), trial, font=font, stroke_width=2)
+        w_width = w_box[2] - w_box[0]
+        if cur and w_width > max_width:
+            line = " ".join(cur)
+            lines.append(line)
+            max_w = max(max_w, draw.textbbox((0, 0), line, font=font, stroke_width=2)[2])
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        line = " ".join(cur)
+        lines.append(line)
+        max_w = max(max_w, draw.textbbox((0, 0), line, font=font, stroke_width=2)[2])
+    return lines, min(max_w, max_width)
+
+def _render_caption_image(text: str, safe_width: int, base_fontsize: int):
+    """
+    Render uppercase text with white fill and black stroke onto a transparent RGBA image.
+    Auto-scales font down if needed to keep within safe_width.
+    """
+    text = text.upper()
+    fontsize = base_fontsize
+    for _ in range(6):  # try a few times to fit width
+        font = _load_font(fontsize)
+        tmp_img = Image.new("RGBA", (safe_width, base_fontsize * 4), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tmp_img)
+        lines, max_line_w = _wrap_text(draw, text, font, safe_width)
+        line_height = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+        spacing = max(4, int(fontsize * 0.25))
+        total_h = len(lines) * line_height + (len(lines) - 1) * spacing
+        if max_line_w <= safe_width:
+            # render final image
+            img = Image.new("RGBA", (safe_width, total_h + spacing * 2), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            y = spacing
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font, stroke_width=2)
+                w = bbox[2] - bbox[0]
+                x = (safe_width - w) // 2
+                draw.text(
+                    (x, y), line, font=font,
+                    fill=(255, 255, 255, 255),
+                    stroke_width=2, stroke_fill=(0, 0, 0, 255)
+                )
+                y += line_height + spacing
+            return img
+        fontsize = max(10, int(fontsize * 0.9))  # shrink and try again
+    # Fallback: single line without wrap
+    font = _load_font(fontsize)
+    img = Image.new("RGBA", (safe_width, fontsize * 2), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.text((0, 0), text, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    return img
+
+# ---------- Video compositor ----------
+
 def add_captions(video_path: Path, segments, output_path: Path):
     video = VideoFileClip(str(video_path))
     clips = [video]
 
-    # Dynamic sizing for mobile/video aspect ratios
     base_fs = max(14, int(video.h / 50))
     padding = base_fs // 2
-
     safe_width = int(video.w * 0.9)  # 90% of video width
-    font_path = Path(__file__).parent / "fonts" / "MREARLN.TTF"
-    font_arg = str(font_path) if font_path.exists() else "Arial"
+    pos_y = int(video.h * 2 / 3) + padding
 
     for start, end, txt in segments:
         duration = max(0.05, end - start)
-        fontsize = int(base_fs * 2.5)  # slightly larger for reels
-        pos_y = int(video.h * 2 / 3) + padding
-
-        txt_clip = TextClip(
-            txt.upper(),
-            fontsize=fontsize,
-            color="white",
-            font=font_arg,
-            size=(safe_width, None),        # wrap text at safe width
-            stroke_color="black",
-            stroke_width=2,
-            method="caption"
-        ).set_start(start).set_duration(duration)
-
-        txt_clip = txt_clip.set_position(("center", pos_y))
-        clips.append(txt_clip)
+        fontsize = int(base_fs * 2.5)  # larger for reels
+        pil_img = _render_caption_image(txt, safe_width, fontsize)
+        np_frame = np.array(pil_img)
+        clip = ImageClip(np_frame, transparent=True).set_start(start).set_duration(duration)
+        clip = clip.set_position(("center", pos_y))
+        clips.append(clip)
 
     final = CompositeVideoClip(clips)
     final.write_videofile(str(output_path), codec="libx264", audio_codec="aac")
 
+# ---------- Main ----------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Caption a video using OpenAI STT (Whisper/4o-transcribe) and MoviePy."
+        description="Caption a video using OpenAI STT (Whisper/4o-transcribe) and Pillow (no ImageMagick)."
     )
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("--output", default="output-captioned.mp4", help="Output mp4 path.")
