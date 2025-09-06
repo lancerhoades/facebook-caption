@@ -1,20 +1,34 @@
-# .dockerignore
-.git
-.github
-.venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.log
-*.tar
-*.gz
+*.pyd
+*.egg-info/
+.venv/
+env/
 
-# Large media/artifacts
-*.mp4
-*.wav
-*.mp3
-transcripts/
+# VCS / CI
+.git/
+.gitignore
+.github/
 
-# OS/editor junk
+# OS/editor
 .DS_Store
 *.swp
+
+# Outputs & media
+transcripts/
+output/
+*.mp4
+*.wav
+*.webm
+*.tar
+.output-image/
+*.log
+
+# Node
+node_modules/
+
+# Build dists
+build/
+dist/

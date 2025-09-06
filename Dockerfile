@@ -22,9 +22,12 @@ RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
  && pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY . .
-# Copy bundled font
+# App code (copy only what’s necessary)
+COPY caption.py handler.py ./
 COPY fonts/MREARLN.TTF /usr/local/share/fonts/MREARLN.TTF
+
+# (Optional) make sure the font is discoverable
+RUN fc-cache -f
 
 # Sanity checks (fail build if imports are broken or file is missing)
 #RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
