@@ -25,6 +25,7 @@ s3 = boto3.client(
     aws_access_key_id=S3_KEY,
     aws_secret_access_key=S3_SECRET,
     region_name=S3_REGION,
+    config=Config(signature_version="s3v4", s3={"addressing_style":"virtual"}),
 )
 
 
@@ -62,7 +63,7 @@ def handler(event):
                 return {"error": "caption.py completed but no output file found."}
 
             # Upload to RunPod S3 volume
-            s3.upload_file(out_mp4, S3_BUCKET, out_name)
+            s3.upload_file(out_mp4, S3_BUCKET, out_name, ExtraArgs={"ContentType":"video/mp4"})
 
             presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": out_name}, ExpiresIn=int(os.getenv("URL_TTL_SECONDS", "86400")))
             file_url = presigned
