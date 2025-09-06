@@ -1,26 +1,28 @@
-FROM python:3.11-slim
+# Stable base (Debian 12/bookworm), avoids trixie churn
+FROM python:3.11-slim-bookworm
 
-# System deps
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    IMAGEMAGICK_BINARY=convert
+
+# System deps (lean)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg imagemagick fonts-dejavu-core wget curl ca-certificates \
+    ffmpeg imagemagick fonts-dejavu-core wget ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Font for MoviePy TextClip (your code expects this path)
-RUN mkdir -p /usr/local/share/fonts \
- && ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF
+# Font alias some code expects
+RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF || true
 
 WORKDIR /app
 
 # Install Python deps first (cache-friendly)
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
+ && pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY . /app
-
-# Helpful for ImageMagick detection by moviepy
-ENV IMAGEMAGICK_BINARY=convert
-ENV PYTHONUNBUFFERED=1
+COPY . .
 
 # Start the RunPod worker
 CMD ["python", "-u", "handler.py"]
