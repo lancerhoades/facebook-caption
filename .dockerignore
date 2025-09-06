@@ -1,0 +1,20 @@
+# .dockerignore
+.git
+.github
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tar
+*.gz
+
+# Large media/artifacts
+*.mp4
+*.wav
+*.mp3
+transcripts/
+
+# OS/editor junk
+.DS_Store
+*.swp
