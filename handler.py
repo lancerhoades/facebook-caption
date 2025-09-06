@@ -6,6 +6,8 @@ import requests
 import runpod
 import boto3
 
+from botocore.config import Config
+
 print("RunPod worker starting…", flush=True)
 
 # --- S3 config ---
@@ -62,7 +64,8 @@ def handler(event):
             # Upload to RunPod S3 volume
             s3.upload_file(out_mp4, S3_BUCKET, out_name)
 
-            file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
+            presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": out_name}, ExpiresIn=int(os.getenv("URL_TTL_SECONDS", "86400")))
+            file_url = presigned
 
             return {
                 "status": "ok",
