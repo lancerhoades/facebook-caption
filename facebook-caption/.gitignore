@@ -1,7 +1,0 @@
-*.mp4
-*.wav
-*.m4a
-*.mov
-__pycache__/
-transcripts/*
-!transcripts/.gitkeep
