@@ -4,9 +4,26 @@ import tempfile
 import subprocess
 import requests
 import runpod
+import boto3
 
-# at top of handler.py
 print("RunPod worker starting…", flush=True)
+
+# --- S3 config ---
+S3_ENDPOINT = "https://s3api-us-ks-2.runpod.io"
+S3_BUCKET = "cqk82s22rj"
+S3_REGION = "us-ks-2"
+
+# Expect your access keys in env vars (set them in RunPod dashboard)
+S3_KEY = os.getenv("S3_ACCESS_KEY")
+S3_SECRET = os.getenv("S3_SECRET_KEY")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=S3_ENDPOINT,
+    aws_access_key_id=S3_KEY,
+    aws_secret_access_key=S3_SECRET,
+    region_name=S3_REGION,
+)
 
 
 def handler(event):
@@ -23,7 +40,7 @@ def handler(event):
         out_mp4 = os.path.join(td, out_name)
 
         try:
-            # download via Python (no wget dependency)
+            # Download video
             with requests.get(video_url, stream=True, timeout=300) as r:
                 r.raise_for_status()
                 with open(in_mp4, "wb") as f:
@@ -31,23 +48,27 @@ def handler(event):
                         if chunk:
                             f.write(chunk)
 
-            # run your existing script (reads OPENAI_API_KEY from env)
+            # Run your captioning script
             proc = subprocess.run(
                 ["python", "/app/caption.py", in_mp4, "--output", out_mp4],
                 check=True,
                 capture_output=True,
-                text=True
+                text=True,
             )
 
             if not os.path.exists(out_mp4):
                 return {"error": "caption.py completed but no output file found."}
 
-            size = os.path.getsize(out_mp4)
+            # Upload to RunPod S3 volume
+            s3.upload_file(out_mp4, S3_BUCKET, out_name)
+
+            file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{out_name}"
+
             return {
                 "status": "ok",
-                "output_path": out_mp4,  # NOTE: path is inside container; upload this if you need a URL
-                "size_bytes": size,
-                "stdout": proc.stdout[-1000:]  # tail for debugging
+                "file_url": file_url,
+                "size_bytes": os.path.getsize(out_mp4),
+                "stdout": proc.stdout[-1000:],  # tail logs for debug
             }
 
         except subprocess.CalledProcessError as e:
@@ -55,10 +76,11 @@ def handler(event):
                 "error": "caption_script_failed",
                 "return_code": e.returncode,
                 "stderr": e.stderr[-2000:],
-                "stdout": e.stdout[-1000:]
+                "stdout": e.stdout[-1000:],
             }
         except Exception as e:
             return {"error": f"runtime_error: {e.__class__.__name__}: {e}"}
 
-# start the Runpod worker
+
+# Start RunPod worker
 runpod.serverless.start({"handler": handler})
