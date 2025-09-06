@@ -5,6 +5,10 @@ import subprocess
 import requests
 import runpod
 
+# at top of handler.py
+print("RunPod worker starting…", flush=True)
+
+
 def handler(event):
     inp = event.get("input", {})
     video_url = inp.get("video_url")

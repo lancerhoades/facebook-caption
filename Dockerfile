@@ -23,6 +23,8 @@ RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
 
 # App code
 COPY . .
+RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
+
 
 # Start the RunPod worker
 CMD ["python", "-u", "handler.py"]
