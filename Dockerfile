@@ -4,12 +4,12 @@ FROM python:3.11-slim-bookworm
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
-    IMAGEMAGICK_BINARY=convert
+    IMAGEMAGICK_BINARY=/usr/bin/convert
 
 # System deps (lean)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg imagemagick fonts-dejavu-core ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && ln -sf /usr/bin/convert /usr/local/bin/convert && rm -rf /var/lib/apt/lists/*
 
 # Font alias some code expects
 #RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF || true
