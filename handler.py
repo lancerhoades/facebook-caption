@@ -63,14 +63,19 @@ def _download_url_to(path: str, url: str):
                 break
             f.write(chunk)
 
-
+def _escape_for_subtitles(path: str) -> str:
+    # Escape characters for ffmpeg subtitles filter
+    # https://ffmpeg.org/ffmpeg-filters.html#subtitles-1
+    # Escape backslashes first, then colons; quotes aren’t used since we don’t quote the filter.
+    return path.replace("\\", "\\\\").replace(":", "\\:")
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
     # Use libass subtitles with custom fonts dir and default MREARLN style
     fonts_dir = "/usr/local/share/fonts/custom"
     base_style = "FontName=MREARLN,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
-    flt = f"subtitles={srt_path}:fontsdir={fonts_dir}:force_style={eff_style}"
+    srt_esc = _escape_for_subtitles(srt_path)
+    flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={eff_style}"
     cmd = [
         "ffmpeg","-hide_banner","-y",
         "-i", video_path,
@@ -80,15 +85,66 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
     ]
     subprocess.check_call(cmd)
 
-
-
-
 def handler(event):
+    """
+    Input:
+      {
+        "job_id": "20250920-xyz",
+        "video_url": "https://...mp4"   (optional: produce captioned.mp4),
+        "style": "Fontsize=24,PrimaryColour=&H00FFFFFF" (optional)
+      }
+    Output:
+      {
+        "srt_key": "...",
+        "srt_url": "...",
+        "captioned_key": "...",      (if video_url provided)
+        "captioned_url": "..."
+      }
+    """
+    inp = event.get("input") or {}
+    job_id = inp.get("job_id")
+    if not job_id:
+        raise RuntimeError("job_id is required")
 
+    # 1) Find transcripts/timestamped.txt on AWS S3
+    ts_key = _key(job_id, "transcripts", "timestamped.txt")
+    # allow a fallback name if upstream differs
+    candidates = [ts_key, _key(job_id, "transcripts", "timestamps.txt")]
+    found = None
+    for k in candidates:
+        try:
+            s3.head_object(Bucket=AWS_S3_BUCKET, Key=k)
+            found = k; break
+        except Exception:
+            continue
+    if not found:
+        raise RuntimeError(f"timestamped.txt not found at s3://{AWS_S3_BUCKET}/{ts_key}")
 
+    ts_local = _download_s3_key_to_tmp(found)
 
+    # 2) Make SRT
+    srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
+    _timestamped_txt_to_srt(ts_local, srt_local)
 
+    # 3) Upload SRT
+    srt_key = _key(job_id, "captions", "captions.srt")
+    up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
+    result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
+    # 4) Optional: burn-in video captions
+    video_url = inp.get("video_url")
+    style     = inp.get("style")
+    if video_url:
+        if not _has_ffmpeg():
+            raise RuntimeError("ffmpeg not present in image; omit video_url to only build SRT.")
+        vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
+        _download_url_to(vid_local, video_url)
+        out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
+        _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
+        cap_key = _key(job_id, "captions", "captioned.mp4")
+        up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
+        result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
 
+    return result
 
 runpod.serverless.start({"handler": handler})
