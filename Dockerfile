@@ -6,9 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     IMAGEMAGICK_BINARY=/usr/bin/convert
 
-# System deps: ffmpeg (libass included), fontconfig for fc-cache, ImageMagick, certs
+# System deps: ffmpeg (with libass), libass9, fontconfig (fc-cache), a fallback font, ImageMagick, certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg fontconfig imagemagick ca-certificates \
+    ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates \
  && ln -sf /usr/bin/convert /usr/local/bin/convert \
  && rm -rf /var/lib/apt/lists/*
 

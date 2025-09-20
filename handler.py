@@ -64,9 +64,8 @@ def _download_url_to(path: str, url: str):
             f.write(chunk)
 
 def _escape_for_subtitles(path: str) -> str:
-    # Escape characters for ffmpeg subtitles filter
+    # Escape backslashes and colons for ffmpeg subtitles filter
     # https://ffmpeg.org/ffmpeg-filters.html#subtitles-1
-    # Escape backslashes first, then colons; quotes aren’t used since we don’t quote the filter.
     return path.replace("\\", "\\\\").replace(":", "\\:")
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
@@ -77,13 +76,17 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
     srt_esc = _escape_for_subtitles(srt_path)
     flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={eff_style}"
     cmd = [
-        "ffmpeg","-hide_banner","-y",
+        "ffmpeg","-hide_banner","-loglevel","verbose","-y",
         "-i", video_path,
         "-vf", flt,
         "-c:a","copy",
         out_path
     ]
-    subprocess.check_call(cmd)
+    try:
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
+        raise RuntimeError(f"ffmpeg failed.\nFilter:\n{flt}\n\nStderr:\n{err}") from None
 
 def handler(event):
     """
