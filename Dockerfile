@@ -1,4 +1,4 @@
-# Stable base (Debian 12/bookworm), avoids trixie churn
+# Stable base (Debian 12/bookworm)
 FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -6,39 +6,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     IMAGEMAGICK_BINARY=/usr/bin/convert
 
-# System deps (lean)
+# System deps: ffmpeg (with libass), fontconfig (for fc-cache), ImageMagick (optional), certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg imagemagick fontconfig fonts-dejavu-core ca-certificates \
- && ln -sf /usr/bin/convert /usr/local/bin/convert && rm -rf /var/lib/apt/lists/*
-
-# Font alias some code expects
-#RUN ln -s /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/local/share/fonts/MREARLN.TTF || true
+    ffmpeg fontconfig imagemagick ca-certificates \
+ && ln -sf /usr/bin/convert /usr/local/bin/convert \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps first (cache-friendly)
+# Python deps first (cache-friendly)
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
  && pip install --no-cache-dir -r requirements.txt
 
 # App code
-# App code (copy only what’s necessary)
 COPY caption.py handler.py ./
-COPY fonts /usr/local/share/fonts/custom
 
-# (Optional) make sure the font is discoverable
-RUN fc-cache -f -v
+# Fonts: copy everything in fonts/ to a predictable system dir
+COPY fonts/ /usr/local/share/fonts/custom/
 
-# Sanity checks (fail build if imports are broken or file is missing)
-#RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
-#RUN python - <<'PY'
-#import sys
-#print("Python OK:", sys.version)
-#import caption
-#print("Import caption OK")
-#import moviepy, PIL, requests, runpod
-#print("Key deps OK")
-#PY
+# Rebuild font cache (don’t fail the build if font cache spews warnings)
+RUN fc-cache -f -v || true
 
-# Use ENTRYPOINT so RunPod doesn’t override it with shell
+# RunPod entrypoint
 ENTRYPOINT ["python", "-u", "handler.py"]
