@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System deps (lean)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg imagemagick fonts-dejavu-core ca-certificates \
+    ffmpeg imagemagick fontconfig fonts-dejavu-core ca-certificates \
  && ln -sf /usr/bin/convert /usr/local/bin/convert && rm -rf /var/lib/apt/lists/*
 
 # Font alias some code expects
@@ -24,10 +24,10 @@ RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
 # App code
 # App code (copy only what’s necessary)
 COPY caption.py handler.py ./
-COPY fonts/MREARLN.TTF /usr/local/share/fonts/MREARLN.TTF
+COPY fonts /usr/local/share/fonts/custom
 
 # (Optional) make sure the font is discoverable
-RUN fc-cache -f
+RUN fc-cache -f -v
 
 # Sanity checks (fail build if imports are broken or file is missing)
 #RUN test -f /app/caption.py || (echo "ERROR: /app/caption.py not found in image" && exit 1)
