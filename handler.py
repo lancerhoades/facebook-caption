@@ -1,4 +1,4 @@
-import os, re, json, tempfile, subprocess, asyncio, aiohttp, boto3
+import os, re, json, tempfile, subprocess, urllib.request, boto3
 from botocore.client import Config
 import runpod
 
@@ -55,14 +55,13 @@ def _has_ffmpeg() -> bool:
     from shutil import which
     return which("ffmpeg") is not None and which("ffprobe") is not None
 
-async def _download_url_to(path: str, url: str):
-    timeout = aiohttp.ClientTimeout(total=None)
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        async with sess.get(url) as r:
-            r.raise_for_status()
-            with open(path, "wb") as f:
-                async for chunk in r.content.iter_chunked(1<<20):
-                    f.write(chunk)
+def _download_url_to(path: str, url: str):
+    with urllib.request.urlopen(url) as r, open(path, "wb") as f:
+        while True:
+            chunk = r.read(1<<20)
+            if not chunk:
+                break
+            f.write(chunk)
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
     # Use ffmpeg subtitles filter; style is optional (libass). Keep simple for portability.
@@ -132,7 +131,7 @@ def handler(event):
         if not _has_ffmpeg():
             raise RuntimeError("ffmpeg not present in image; omit video_url to only build SRT.")
         vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
-        asyncio.get_event_loop().run_until_complete(_download_url_to(vid_local, video_url))
+        _download_url_to(vid_local, video_url)
         out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
         _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
         cap_key = _key(job_id, "captions", "captioned.mp4")
