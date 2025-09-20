@@ -1,153 +1,144 @@
-import os
-import uuid
-import tempfile
-import subprocess
-import requests
+import os, re, json, tempfile, subprocess, asyncio, aiohttp, boto3
+from botocore.client import Config
 import runpod
-import boto3
-from botocore.config import Config
 
-print("RunPod worker starting…", flush=True)
+# --------- ENV ---------
+AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
+AWS_S3_BUCKET  = os.getenv("AWS_S3_BUCKET")
+S3_PREFIX_BASE = os.getenv("S3_PREFIX_BASE", "jobs")
 
-# -----------------------------------------------------------------------------
-# Config: choose backend via STORAGE_BACKEND = "aws" or "runpod"
-# -----------------------------------------------------------------------------
-STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "aws").strip().lower()
-URL_TTL_SECONDS = int(os.getenv("URL_TTL_SECONDS", "86400"))  # presigned URL TTL
-PUBLIC_PREFIX   = os.getenv("PUBLIC_PREFIX", "facebook-caption").strip("/")
+if not AWS_S3_BUCKET:
+    raise RuntimeError("AWS_S3_BUCKET is required for S3-only caption worker")
 
-# ---- AWS S3 (your own AWS account) ----
-AWS_BUCKET = os.getenv("AWS_S3_BUCKET")             # e.g. "toltranscriberfinal"
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-# Optional explicit endpoint (usually leave unset for AWS):
-AWS_ENDPOINT = os.getenv("AWS_S3_ENDPOINT")         # e.g. "https://s3.us-east-1.amazonaws.com"
+# Plain AWS S3 client (NO RunPod endpoint)
+s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
 
-# ---- RunPod S3 (RunPod network volume via S3 API) ----
-RP_ENDPOINT = os.getenv("RP_S3_ENDPOINT", "https://s3api-us-ks-2.runpod.io")
-RP_BUCKET   = os.getenv("RP_S3_BUCKET",   "cqk82s22rj")
-RP_REGION   = os.getenv("RP_S3_REGION",   "us-ks-2")
+def _key(job_id: str, *parts: str) -> str:
+    safe = [p.strip("/").replace("\\","/") for p in parts if p]
+    return "/".join([S3_PREFIX_BASE.strip("/"), job_id] + safe)
 
-# ---- Credentials (both backends read the same env names) ----
-ACCESS_KEY = (
-    os.getenv("AWS_ACCESS_KEY_ID") or
-    os.getenv("S3_ACCESS_KEY")     or
-    os.getenv("RUN_S3_ACCESS_KEY")
-)
-SECRET_KEY = (
-    os.getenv("AWS_SECRET_ACCESS_KEY") or
-    os.getenv("S3_SECRET_KEY")         or
-    os.getenv("RUN_S3_SECRET_KEY")
-)
+def _presign(key: str, expires=7*24*3600) -> str:
+    return s3.generate_presigned_url("get_object", Params={"Bucket": AWS_S3_BUCKET, "Key": key}, ExpiresIn=expires)
 
-if not ACCESS_KEY or not SECRET_KEY:
-    raise RuntimeError("Missing S3 credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY "
-                       "or S3_ACCESS_KEY/S3_SECRET_KEY in your environment.")
+def _download_s3_key_to_tmp(key: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="cap_", suffix=os.path.basename(key).replace("/", "_"))
+    os.close(fd)
+    s3.download_file(AWS_S3_BUCKET, key, path)
+    return path
 
-def build_client_and_urls():
-    """
-    Returns: (s3_client, bucket, region, public_base_url)
-      - public_base_url is the base to build a plain URL:
-        * AWS:   https://<bucket>.s3.<region>.amazonaws.com
-        * RunPod: https://s3api-<region>.runpod.io/<bucket>
-    """
-    if STORAGE_BACKEND == "aws":
-        # Use AWS' own endpoint resolution unless AWS_ENDPOINT is explicitly set
-        client = boto3.client(
-            "s3",
-            endpoint_url=(AWS_ENDPOINT or None),
-            aws_access_key_id=ACCESS_KEY,
-            aws_secret_access_key=SECRET_KEY,
-            region_name=AWS_REGION,
-            config=Config(signature_version="s3v4"),
-        )
-        if AWS_ENDPOINT:
-            public_base = f"{AWS_ENDPOINT.rstrip('/')}/{AWS_BUCKET}"
-        else:
-            public_base = f"https://{AWS_BUCKET}.s3.{AWS_REGION}.amazonaws.com"
-        return client, AWS_BUCKET, AWS_REGION, public_base
+def _upload_tmp_to_s3(path: str, key: str, content_type: str | None = None) -> dict:
+    extra = {"ContentType": content_type} if content_type else {}
+    s3.upload_file(path, AWS_S3_BUCKET, key, ExtraArgs=extra)
+    return {"key": key, "url": _presign(key)}
 
-    # Default to RunPod S3
-    client = boto3.client(
-        "s3",
-        endpoint_url=RP_ENDPOINT,
-        aws_access_key_id=ACCESS_KEY,
-        aws_secret_access_key=SECRET_KEY,
-        region_name=RP_REGION,
-        config=Config(signature_version="s3v4"),  # path/virtual both OK; RunPod is picky about auth, not path
-    )
-    public_base = f"{RP_ENDPOINT.rstrip('/')}/{RP_BUCKET}"
-    return client, RP_BUCKET, RP_REGION, public_base
+# ----- timestamped.txt -> SRT -----
+def _timestamped_txt_to_srt(txt_path: str, srt_path: str):
+    # Lines like: 00:00:01.000 --> 00:00:03.500 | Some text
+    pat = re.compile(r"^\s*(\d\d:\d\d:\d\d\.\d{3})\s*-->\s*(\d\d:\d\d:\d\d\.\d{3})\s*\|\s*(.+?)\s*$")
+    i = 1
+    wrote_any = False
+    with open(txt_path, "r", encoding="utf-8") as fin, open(srt_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            m = pat.match(line)
+            if not m:
+                continue
+            start, end, text = m.group(1), m.group(2), m.group(3)
+            start = start.replace(".", ",")
+            end   = end.replace(".", ",")
+            fout.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+            i += 1
+            wrote_any = True
+    if not wrote_any:
+        raise RuntimeError("No valid caption lines found in transcripts/timestamped.txt")
 
+def _has_ffmpeg() -> bool:
+    from shutil import which
+    return which("ffmpeg") is not None and which("ffprobe") is not None
+
+async def _download_url_to(path: str, url: str):
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        async with sess.get(url) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                async for chunk in r.content.iter_chunked(1<<20):
+                    f.write(chunk)
+
+def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
+    # Use ffmpeg subtitles filter; style is optional (libass). Keep simple for portability.
+    flt = f"subtitles='{srt_path}'"
+    if style:
+        style = style.replace("'", "").replace('"', "")
+        flt = f"subtitles='{srt_path}':force_style='{style}'"
+    cmd = [
+        "ffmpeg","-hide_banner","-y",
+        "-i", video_path,
+        "-vf", flt,
+        "-c:a","copy",
+        out_path
+    ]
+    subprocess.check_call(cmd)
 
 def handler(event):
-    inp = event.get("input", {})
-    video_url = inp.get("video_url")
-    out_name  = inp.get("output_name", f"output-{uuid.uuid4().hex}.mp4")
+    """
+    Input:
+      {
+        "job_id": "20250920-xyz",
+        "video_url": "https://...mp4"   (optional: produce captioned.mp4),
+        "style": "Fontsize=24,PrimaryColour=&H00FFFFFF" (optional)
+      }
+    Output:
+      {
+        "srt_key": "...",
+        "srt_url": "...",
+        "captioned_key": "...",      (if video_url provided)
+        "captioned_url": "..."
+      }
+    """
+    inp = event.get("input") or {}
+    job_id = inp.get("job_id")
+    if not job_id:
+        raise RuntimeError("job_id is required")
 
-    if not video_url:
-        return {"error": "video_url is required"}
-
-    s3, bucket, region, public_base = build_client_and_urls()
-    s3_key = f"{PUBLIC_PREFIX}/{out_name.lstrip('/')}"
-
-    with tempfile.TemporaryDirectory() as td:
-        in_mp4  = os.path.join(td, "input.mp4")
-        # keep a persistent copy on the mounted volume
-        out_mp4 = os.path.join("/runpod-volume", out_name)
-
+    # 1) Find transcripts/timestamped.txt on AWS S3
+    ts_key = _key(job_id, "transcripts", "timestamped.txt")
+    # allow a fallback name if upstream differs
+    candidates = [ts_key, _key(job_id, "transcripts", "timestamps.txt")]
+    found = None
+    for k in candidates:
         try:
-            # Download source video
-            with requests.get(video_url, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                with open(in_mp4, "wb") as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
+            s3.head_object(Bucket=AWS_S3_BUCKET, Key=k)
+            found = k; break
+        except Exception:
+            continue
+    if not found:
+        raise RuntimeError(f"timestamped.txt not found at s3://{AWS_S3_BUCKET}/{ts_key}")
 
-            # Run captioner
-            proc = subprocess.run(
-                ["python", "/app/caption.py", in_mp4, "--output", out_mp4],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    ts_local = _download_s3_key_to_tmp(found)
 
-            if not os.path.exists(out_mp4):
-                return {"error": "caption.py completed but no output file found."}
+    # 2) Make SRT
+    srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
+    _timestamped_txt_to_srt(ts_local, srt_local)
 
-            # Upload (no ACLs; rely on presigned or bucket policy)
-            s3.upload_file(out_mp4, bucket, s3_key, ExtraArgs={"ContentType": "video/mp4"})
+    # 3) Upload SRT
+    srt_key = _key(job_id, "captions", "captions.srt")
+    up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
+    result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
-            # Presigned URL (works everywhere, including browsers, for AWS proper)
-            presigned_url = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket, "Key": s3_key},
-                ExpiresIn=URL_TTL_SECONDS,
-            )
+    # 4) Optional: burn-in
+    video_url = inp.get("video_url")
+    style     = inp.get("style")
+    if video_url:
+        if not _has_ffmpeg():
+            raise RuntimeError("ffmpeg not present in image; omit video_url to only build SRT.")
+        vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
+        asyncio.get_event_loop().run_until_complete(_download_url_to(vid_local, video_url))
+        out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
+        _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
+        cap_key = _key(job_id, "captions", "captioned.mp4")
+        up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
+        result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
 
-            # Plain URL (will only be browser-accessible if the bucket/prefix is public)
-            plain_url = f"{public_base}/{s3_key}"
-
-            return {
-                "status": "ok",
-                "backend": STORAGE_BACKEND,
-                "file_url": presigned_url,   # always safe to use
-                "plain_url": plain_url,      # requires public policy if you want no-token direct access
-                "bucket": bucket,
-                "region": region,
-                "s3_key": s3_key,
-                "size_bytes": os.path.getsize(out_mp4),
-                "stdout": proc.stdout[-1000:],
-            }
-
-        except subprocess.CalledProcessError as e:
-            return {
-                "error": "caption_script_failed",
-                "return_code": e.returncode,
-                "stderr": e.stderr[-2000:],
-                "stdout": e.stdout[-1000:],
-            }
-        except Exception as e:
-            return {"error": f"runtime_error: {e.__class__.__name__}: {e}"}
+    return result
 
 runpod.serverless.start({"handler": handler})
