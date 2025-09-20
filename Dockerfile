@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     IMAGEMAGICK_BINARY=/usr/bin/convert
 
-# System deps: ffmpeg (with libass), fontconfig (for fc-cache), ImageMagick (optional), certs
+# System deps: ffmpeg (libass included), fontconfig for fc-cache, ImageMagick, certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg fontconfig imagemagick ca-certificates \
  && ln -sf /usr/bin/convert /usr/local/bin/convert \
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps first (cache-friendly)
+# Python deps first
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
  && pip install --no-cache-dir -r requirements.txt
@@ -22,11 +22,9 @@ RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
 # App code
 COPY caption.py handler.py ./
 
-# Fonts: copy everything in fonts/ to a predictable system dir
+# Fonts: copy all and rebuild cache
 COPY fonts/ /usr/local/share/fonts/custom/
-
-# Rebuild font cache (don’t fail the build if font cache spews warnings)
 RUN fc-cache -f -v || true
 
-# RunPod entrypoint
+# Entrypoint for RunPod
 ENTRYPOINT ["python", "-u", "handler.py"]
