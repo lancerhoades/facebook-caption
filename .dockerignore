@@ -16,3 +16,5 @@ __pycache__/
 *.tar.gz
 _bak/
 facebook-caption/
+!tools/
+!tools/**
