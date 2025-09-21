@@ -61,7 +61,7 @@ def _escape_for_subtitles(path: str) -> str:
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
     fonts_dir = "/usr/local/share/fonts/custom"
-    base_style = "FontName=MREARLN,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
+    base_style = "FontName=MisterEarl BT,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
     fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
     srt_esc = _escape_for_subtitles(srt_path)
