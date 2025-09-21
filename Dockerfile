@@ -11,8 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN set -eux; \
     echo "[STEP 1] apt-get install"; \
     apt-get update; \
-    apt-get install -y --no-install-recommends \
-        ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates; \
+    apt-get install -y --no-install-recommends gawk \
+        ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates gawk; \
     ln -sf /usr/bin/convert /usr/local/bin/convert; \
     rm -rf /var/lib/apt/lists/*; \
     echo "[STEP 1 DONE]"
@@ -31,6 +31,7 @@ RUN set -eux; \
 
 # [STEP 3] App code
 COPY caption.py handler.py ./
+COPY tools/ /app/tools/
 
 # [STEP 4] Fonts and cache
 COPY fonts/ /usr/local/share/fonts/custom/

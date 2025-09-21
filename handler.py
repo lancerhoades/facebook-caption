@@ -20,6 +20,11 @@ print(f"[CFG] FASTWH id={FASTWH_ID} trans={FASTWH_TRANS} vad={FASTWH_VAD} word_t
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FALLBACK_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
 
+# Caption styling & chunking controls
+FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
+MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # 0 = disabled
+MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))     # 0 = no cap; seconds
+
 if not AWS_S3_BUCKET:
     raise RuntimeError("AWS_S3_BUCKET is required")
 
@@ -61,7 +66,8 @@ def _escape_for_subtitles(path: str) -> str:
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
     fonts_dir = "/usr/local/share/fonts/custom"
-    base_style = "FontName=MisterEarl BT,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
+    # Use the *family* name (see: fc-list). Default is MisterEarl BT.
+    base_style = f"FontName={FONT_FAMILY},Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
     fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
     srt_esc = _escape_for_subtitles(srt_path)
@@ -382,6 +388,19 @@ def handler(event):
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
 
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
+
+    # 4a) optional: chunkify SRT into short, fast-moving cues for reels
+    try:
+        if MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0:
+            import tempfile, subprocess, os
+            tmp_fd, tuned_srt = tempfile.mkstemp(prefix="captions_tuned_", suffix=".srt"); os.close(tmp_fd)
+            awk = "/app/tools/srt_chunkify.awk"
+            cmd = ["awk", f"-vW={MAX_WORDS_PER_CU}", f"-vD={MAX_CUE_DURATION}", "-f", awk, srt_local]
+            with open(tuned_srt, "w", encoding="utf-8") as outf:
+                subprocess.run(cmd, check=True, stdout=outf)
+            srt_local = tuned_srt
+    except Exception as _e:
+        print("[CHUNKIFY] Skipped (no awk or error):", _e)
 
     # 5) burn-in captions
     if not _has_ffmpeg():
