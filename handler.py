@@ -63,8 +63,9 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
     fonts_dir = "/usr/local/share/fonts/custom"
     base_style = "FontName=MREARLN,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
+    fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
     srt_esc = _escape_for_subtitles(srt_path)
-    flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={eff_style}"
+    flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={fs_esc}"
     cmd = [
         "ffmpeg","-hide_banner","-loglevel","error","-stats","-threads","1","-y",
         "-i", video_path,
