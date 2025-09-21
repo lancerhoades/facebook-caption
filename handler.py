@@ -73,7 +73,6 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         out_path
     ]
     try:
-    print(f"[FALLBACK] calling caption.py model={FALLBACK_MODEL} lang={LANG_HINT}")
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
@@ -142,34 +141,6 @@ def _vtt_to_srt(vtt: str) -> str:
             buf.append(ln)
     flush_block()
     return "\n".join(out) + "\n"
-def _vtt_to_srt(vtt: str) -> str:
-    lines = [ln.rstrip("\n") for ln in vtt.splitlines()]
-    out = []
-    idx = 1
-    buf = []
-    def flush_block():
-        nonlocal idx
-        if not buf: return
-        tl = buf[0].replace(".", ",")
-        out.append(str(idx)); idx += 1
-        out.append(tl)
-        for t in buf[1:]:
-            out.append(t)
-        out.append("")
-        buf.clear()
-    for ln in lines:
-        s = ln.strip()
-        if s == "WEBVTT" or s.startswith("NOTE"):
-            continue
-        if "-->" in s:
-            flush_block()
-            buf.append(s)
-        elif s == "":
-            flush_block()
-        else:
-            buf.append(ln)
-    flush_block()
-    return "\n".join(out) + "\n"
 # --------- FastWhisper endpoint call ---------
 def _fastwh_to_srt(video_url: str) -> str:
     """
@@ -199,9 +170,6 @@ def _fastwh_to_srt(video_url: str) -> str:
     print("[FASTWH] output keys:", list(((data or {}).get("output") or {}).keys()) if isinstance((data or {}).get("output"), dict) else None)
 
     print(f"[FASTWH] status={r.status_code} trans={FASTWH_TRANS} url={url}")
-    print("[FASTWH] top keys:", list((data or {}).keys()))
-    print("[FASTWH] output type:", type((data or {}).get("output")))
-    print("[FASTWH] output keys:", list(((data or {}).get("output") or {}).keys()) if isinstance((data or {}).get("output"), dict) else None)
 
 
     # try common shapes
@@ -268,7 +236,6 @@ def _openai_to_txt(video_path: str) -> str:
     # only transcription; no burn
     here = pathlib.Path(__file__).parent.resolve()
     cap_py = here / "caption.py"
-    print(f"[FALLBACK] calling caption.py model={FALLBACK_MODEL} lang={LANG_HINT}")
     out = subprocess.run(
         ["python3", str(cap_py), str(video_path), "--model", FALLBACK_MODEL, "--language", (LANG_HINT or "")],
         check=True, capture_output=True, text=True
