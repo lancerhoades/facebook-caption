@@ -154,7 +154,7 @@ def _fastwh_to_srt(video_url: str) -> str:
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type":"application/json"}
     payload = {
         "input": {
-            "audio_url": video_url,          # the worker can fetch from S3
+            "audio_url": video_url, "file_url": video_url,          # the worker can fetch from S3
             "transcription": "srt",   # expect "srt"
             "enable_vad": FASTWH_VAD,
             "word_timestamps": FASTWH_WORDTS,
@@ -164,15 +164,18 @@ def _fastwh_to_srt(video_url: str) -> str:
     r = requests.post(url, headers=headers, json=payload, timeout=600)
     r.raise_for_status()
     data = r.json()
-    print(f"[FASTWH] status={r.status_code} trans={FASTWH_TRANS} url={url}")
-    print("[FASTWH] top keys:", list((data or {}).keys()))
-    print("[FASTWH] output type:", type((data or {}).get("output")))
-    print("[FASTWH] output keys:", list(((data or {}).get("output") or {}).keys()) if isinstance((data or {}).get("output"), dict) else None)
+    
+    print(f"[FASTWH] status={r.status_code} url={url}")
+    try:
+        body_snip = (r.text or "")[:1000].replace("\n"," ")
+        print("[FASTWH] body:", body_snip)
+        print("[FASTWH] headers:", {k:v for k,v in list(r.headers.items())[:6]})
+    except Exception as _e:
+        print("[FASTWH] log-exc:", _e)
+    print("[FASTWH] json keys:", list((data or {}).keys()))
+    outv = (data or {}).get("output")
+    print("[FASTWH] output type:", type(outv), "keys:", (list(outv.keys()) if isinstance(outv, dict) else None))
 
-    print(f"[FASTWH] status={r.status_code} trans={FASTWH_TRANS} url={url}")
-
-
-    # try common shapes
     out = data.get("output") or {}
     if isinstance(out, str):
         return out
@@ -222,30 +225,38 @@ def _fastwh_to_srt(video_url: str) -> str:
     except Exception:
         pass
 
+    # Lenient fallbacks for odd templates
+
+    if isinstance(data, dict):
+
+        # direct top-level srt/vtt
+
+        if isinstance(data.get("srt"), str) and "-->" in data["srt"]:
+
+            return data["srt"]
+
+        if isinstance(data.get("vtt"), str) and data["vtt"].lstrip().startswith("WEBVTT"):
+
+            return _vtt_to_srt(data["vtt"])
+
+        # common nesting: data.get("data", {}).get("srt")
+
+        nest = data.get("data") or {}
+
+        if isinstance(nest, dict):
+
+            if isinstance(nest.get("srt"), str) and "-->" in nest["srt"]:
+
+                return nest["srt"]
+
+            if isinstance(nest.get("vtt"), str) and nest["vtt"].lstrip().startswith("WEBVTT"):
+
+                return _vtt_to_srt(nest["vtt"])
+
+
     raise RuntimeError(f"FastWhisper response did not contain SRT text. Output keys: {list(out.keys()) if isinstance(out,dict) else type(out)}")
 
 # --------- OpenAI fallback (plain whisper) ---------
-def _openai_to_txt(video_path: str) -> str:
-    """
-    Fallback: uses local OpenAI Whisper to produce timestamped TXT (seconds) we convert to SRT.
-    Calls caption.py as a module to avoid adding heavy deps here.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("No RUNPOD endpoint available and OPENAI_API_KEY missing for fallback.")
-    # run caption.py to create transcripts/<stem>-captions.txt (seconds-format)
-    # only transcription; no burn
-    here = pathlib.Path(__file__).parent.resolve()
-    cap_py = here / "caption.py"
-    out = subprocess.run(
-        ["python3", str(cap_py), str(video_path), "--model", FALLBACK_MODEL, "--language", (LANG_HINT or "")],
-        check=True, capture_output=True, text=True
-    )
-    # caption.py writes to transcripts/<stem>-captions.txt
-    transcripts_dir = pathlib.Path(video_path).parent / "transcripts"
-    guess = list(transcripts_dir.glob(f"{pathlib.Path(video_path).stem}-captions.txt"))
-    if not guess:
-        raise RuntimeError("Fallback transcriber ran but no transcripts/*-captions.txt found.")
-    return open(guess[0], "r", encoding="utf-8").read()
 
 # --------- main handler ---------
 def handler(event):
@@ -345,3 +356,27 @@ def handler(event):
     return result
 
 runpod.serverless.start({"handler": handler})
+def _openai_to_txt(video_path: str) -> str:
+    """
+    Fallback: uses local OpenAI Whisper to produce timestamped TXT (seconds) we convert to SRT.
+    Calls caption.py as a module to avoid adding heavy deps here.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("No RUNPOD endpoint available and OPENAI_API_KEY missing for fallback.")
+    # run caption.py to create transcripts/<stem>-captions.txt (seconds-format)
+    # only transcription; no burn
+    here = pathlib.Path(__file__).parent.resolve()
+    cap_py = here / "caption.py"
+    out = subprocess.run(["python3", str(cap_py), str(video_path), "--model", FALLBACK_MODEL, "--language", (LANG_HINT or "")], capture_output=True, text=True)
+    print("[FALLBACK] rc:", out.returncode)
+    if out.stdout: print("[FALLBACK][stdout]", out.stdout[:800])
+    if out.stderr: print("[FALLBACK][stderr]", out.stderr[:800])
+    if out.returncode != 0:
+        raise RuntimeError("caption.py failed")
+    # caption.py writes to transcripts/<stem>-captions.txt
+    transcripts_dir = pathlib.Path(video_path).parent / "transcripts"
+    guess = list(transcripts_dir.glob(f"{pathlib.Path(video_path).stem}-captions.txt"))
+    if not guess:
+        raise RuntimeError("Fallback transcriber ran but no transcripts/*-captions.txt found.")
+    return open(guess[0], "r", encoding="utf-8").read()
+
