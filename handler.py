@@ -10,10 +10,11 @@ S3_PREFIX_BASE = os.getenv("S3_PREFIX_BASE", "jobs")
 # FastWhisper endpoint (preferred)
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 FASTWH_ID      = os.getenv("RUNPOD_FASTWHISPER_ENDPOINT_ID")
-FASTWH_TRANS   = os.getenv("FASTWH_TRANSCRIPTION", "srt")           # use "srt" so we get timestamps
+FASTWH_TRANS   = "srt"  # forced to srt to guarantee timestamps
 FASTWH_VAD     = os.getenv("FASTWH_ENABLE_VAD", "true").lower() in ("1","true","yes","on")
 FASTWH_WORDTS  = os.getenv("FASTWH_WORD_TIMESTAMPS", "true").lower() in ("1","true","yes","on")
 LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None               # e.g. "en"
+print(f"[CFG] FASTWH id={FASTWH_ID} trans={FASTWH_TRANS} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
 
 # OpenAI fallback
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -72,6 +73,7 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         out_path
     ]
     try:
+    print(f"[FALLBACK] calling caption.py model={FALLBACK_MODEL} lang={LANG_HINT}")
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
@@ -109,6 +111,65 @@ def _timestamped_txt_to_srt(txt_path: str, srt_path: str):
         for i,s,e,t in out:
             f.write(f"{i}\n{_fmt_hms(s)} --> {_fmt_hms(e)}\n{t}\n\n")
 
+def _vtt_to_srt(vtt: str) -> str:
+    lines = [ln.rstrip("\n") for ln in vtt.splitlines()]
+    out = []
+    idx = 1
+    buf = []
+    def flush_block():
+        nonlocal idx
+        if not buf: return
+        # buf[0] should be the timeline line like 00:00:01.000 --> 00:00:02.500
+        # Convert dots to commas on the timeline only.
+        tl = buf[0].replace(".", ",")
+        out.append(str(idx)); idx += 1
+        out.append(tl)
+        for t in buf[1:]:
+            out.append(t)
+        out.append("")
+        buf.clear()
+    for ln in lines:
+        s = ln.strip()
+        if s == "WEBVTT" or s.startswith("NOTE"):
+            continue
+        if "-->" in s:
+            # start of a new cue
+            flush_block()
+            buf.append(s)
+        elif s == "":
+            flush_block()
+        else:
+            buf.append(ln)
+    flush_block()
+    return "\n".join(out) + "\n"
+def _vtt_to_srt(vtt: str) -> str:
+    lines = [ln.rstrip("\n") for ln in vtt.splitlines()]
+    out = []
+    idx = 1
+    buf = []
+    def flush_block():
+        nonlocal idx
+        if not buf: return
+        tl = buf[0].replace(".", ",")
+        out.append(str(idx)); idx += 1
+        out.append(tl)
+        for t in buf[1:]:
+            out.append(t)
+        out.append("")
+        buf.clear()
+    for ln in lines:
+        s = ln.strip()
+        if s == "WEBVTT" or s.startswith("NOTE"):
+            continue
+        if "-->" in s:
+            flush_block()
+            buf.append(s)
+        elif s == "":
+            flush_block()
+        else:
+            buf.append(ln)
+    flush_block()
+    return "\n".join(out) + "\n"
 # --------- FastWhisper endpoint call ---------
 def _fastwh_to_srt(video_url: str) -> str:
     """
@@ -123,7 +184,7 @@ def _fastwh_to_srt(video_url: str) -> str:
     payload = {
         "input": {
             "audio_url": video_url,          # the worker can fetch from S3
-            "transcription": FASTWH_TRANS,   # expect "srt"
+            "transcription": "srt",   # expect "srt"
             "enable_vad": FASTWH_VAD,
             "word_timestamps": FASTWH_WORDTS,
             **({"language": LANG_HINT} if LANG_HINT else {})
@@ -132,6 +193,16 @@ def _fastwh_to_srt(video_url: str) -> str:
     r = requests.post(url, headers=headers, json=payload, timeout=600)
     r.raise_for_status()
     data = r.json()
+    print(f"[FASTWH] status={r.status_code} trans={FASTWH_TRANS} url={url}")
+    print("[FASTWH] top keys:", list((data or {}).keys()))
+    print("[FASTWH] output type:", type((data or {}).get("output")))
+    print("[FASTWH] output keys:", list(((data or {}).get("output") or {}).keys()) if isinstance((data or {}).get("output"), dict) else None)
+
+    print(f"[FASTWH] status={r.status_code} trans={FASTWH_TRANS} url={url}")
+    print("[FASTWH] top keys:", list((data or {}).keys()))
+    print("[FASTWH] output type:", type((data or {}).get("output")))
+    print("[FASTWH] output keys:", list(((data or {}).get("output") or {}).keys()) if isinstance((data or {}).get("output"), dict) else None)
+
 
     # try common shapes
     out = data.get("output") or {}
@@ -145,6 +216,44 @@ def _fastwh_to_srt(video_url: str) -> str:
             return out["text_srt"]
         if "text" in out and isinstance(out["text"], str) and "-->" in out["text"]:
             return out["text"]  # already srt-like
+    if isinstance(out, dict) and "vtt" in out and isinstance(out["vtt"], str):
+        return _vtt_to_srt(out["vtt"])
+
+    if isinstance(out, str) and out.lstrip().startswith("WEBVTT"):
+        return _vtt_to_srt(out)
+
+    if isinstance(data, dict):
+        if isinstance(data.get("vtt"), str):
+            return _vtt_to_srt(data["vtt"])
+        if isinstance(data.get("srt"), str):
+            return data["srt"]
+
+    import textwrap
+    try:
+        body_snip = textwrap.shorten(r.text.replace("\n"," "), width=600, placeholder=" ... ")
+        print("[FASTWH] raw body snippet:", body_snip)
+    except Exception:
+        pass
+
+    if isinstance(out, dict) and "vtt" in out and isinstance(out["vtt"], str):
+        return _vtt_to_srt(out["vtt"])
+
+    if isinstance(out, str) and out.lstrip().startswith("WEBVTT"):
+        return _vtt_to_srt(out)
+
+    if isinstance(data, dict):
+        if isinstance(data.get("vtt"), str):
+            return _vtt_to_srt(data["vtt"])
+        if isinstance(data.get("srt"), str):
+            return data["srt"]
+
+    import textwrap
+    try:
+        body_snip = textwrap.shorten(r.text.replace("\n"," "), width=600, placeholder=" ... ")
+        print("[FASTWH] raw body snippet:", body_snip)
+    except Exception:
+        pass
+
     raise RuntimeError(f"FastWhisper response did not contain SRT text. Output keys: {list(out.keys()) if isinstance(out,dict) else type(out)}")
 
 # --------- OpenAI fallback (plain whisper) ---------
@@ -159,6 +268,7 @@ def _openai_to_txt(video_path: str) -> str:
     # only transcription; no burn
     here = pathlib.Path(__file__).parent.resolve()
     cap_py = here / "caption.py"
+    print(f"[FALLBACK] calling caption.py model={FALLBACK_MODEL} lang={LANG_HINT}")
     out = subprocess.run(
         ["python3", str(cap_py), str(video_path), "--model", FALLBACK_MODEL, "--language", (LANG_HINT or "")],
         check=True, capture_output=True, text=True
