@@ -31,25 +31,82 @@ def _upload_tmp_to_s3(path: str, key: str, content_type: str | None = None) -> d
     s3.upload_file(path, AWS_S3_BUCKET, key, ExtraArgs=extra)
     return {"key": key, "url": _presign(key)}
 
-# ----- timestamped.txt -> SRT -----
+# ----- timestamped/captions.txt -> SRT (robust) -----
 def _timestamped_txt_to_srt(txt_path: str, srt_path: str):
-    # Lines like: 00:00:01.000 --> 00:00:03.500 | Some text
-    pat = re.compile(r"^\s*(\d\d:\d\d:\d\d\.\d{3})\s*-->\s*(\d\d:\d\d:\d\d\.\d{3})\s*\|\s*(.+?)\s*$")
-    i = 1
-    wrote_any = False
-    with open(txt_path, "r", encoding="utf-8") as fin, open(srt_path, "w", encoding="utf-8") as fout:
-        for line in fin:
-            m = pat.match(line)
-            if not m:
+    """
+    Accepts either:
+      1) One-line entries with pipe:
+         HH:MM:SS.mmm --> HH:MM:SS.mmm | text
+      2) Two-line blocks with seconds:
+         12.34 --> 15.67
+         text
+      3) Two-line blocks with HH:MM:SS.mmm:
+         00:00:12.340 --> 00:00:15.670
+         text
+    """
+    def _fmt_srt_time_from_secs(secs: float) -> str:
+        ms_total = int(round(secs * 1000.0))
+        hh = ms_total // 3_600_000; ms_total %= 3_600_000
+        mm = ms_total // 60_000;    ms_total %= 60_000
+        ss = ms_total // 1000
+        ms = ms_total % 1000
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    def _parse_hms_to_secs(hms: str) -> float:
+        hh, mm, rest = hms.split(":")
+        ss, mmm = rest.split(".")
+        return (int(hh)*3600) + (int(mm)*60) + int(ss) + (int(mmm)/1000.0)
+
+    pat_line_one = re.compile(
+        r"^\s*(?P<s_hms>\d\d:\d\d:\d\d\.\d{3})\s*-->\s*(?P<e_hms>\d\d:\d\d:\d\d\.\d{3})\s*\|\s*(?P<text>.+?)\s*$"
+    )
+    pat_secs = re.compile(r"^\s*(?P<s_sec>\d+(?:\.\d+)?)\s*-->\s*(?P<e_sec>\d+(?:\.\d+)?)\s*$")
+    pat_hms_only = re.compile(r"^\s*(?P<s_hms>\d\d:\d\d:\d\d\.\d{3})\s*-->\s*(?P<e_hms>\d\d:\d\d:\d\d\.\d{3})\s*$")
+
+    with open(txt_path, "r", encoding="utf-8") as fin:
+        lines = [ln.rstrip("\n") for ln in fin]
+
+    out = []
+    i = 0
+    idx = 1
+    while i < len(lines):
+        ln = lines[i].strip()
+
+        m1 = pat_line_one.match(ln)
+        if m1:
+            s = _parse_hms_to_secs(m1.group("s_hms"))
+            e = _parse_hms_to_secs(m1.group("e_hms"))
+            text = m1.group("text").strip()
+            out.append((idx, s, e, text)); idx += 1; i += 1
+            continue
+
+        m2 = pat_secs.match(ln)
+        if m2 and i+1 < len(lines):
+            text = lines[i+1].strip()
+            if text:
+                s = float(m2.group("s_sec")); e = float(m2.group("e_sec"))
+                out.append((idx, s, e, text)); idx += 1; i += 2
+                if i < len(lines) and not lines[i].strip(): i += 1
                 continue
-            start, end, text = m.group(1), m.group(2), m.group(3)
-            start = start.replace(".", ",")
-            end   = end.replace(".", ",")
-            fout.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-            i += 1
-            wrote_any = True
-    if not wrote_any:
-        raise RuntimeError("No valid caption lines found in transcripts/timestamped.txt")
+
+        m3 = pat_hms_only.match(ln)
+        if m3 and i+1 < len(lines):
+            text = lines[i+1].strip()
+            if text:
+                s = _parse_hms_to_secs(m3.group("s_hms"))
+                e = _parse_hms_to_secs(m3.group("e_hms"))
+                out.append((idx, s, e, text)); idx += 1; i += 2
+                if i < len(lines) and not lines[i].strip(): i += 1
+                continue
+
+        i += 1
+
+    if not out:
+        raise RuntimeError("No valid caption lines found in transcript file; check its format.")
+
+    with open(srt_path, "w", encoding="utf-8") as fout:
+        for idx, s, e, text in out:
+            fout.write(f"{idx}\n{_fmt_srt_time_from_secs(s)} --> {_fmt_srt_time_from_secs(e)}\n{text}\n\n")
 
 def _has_ffmpeg() -> bool:
     from shutil import which
@@ -59,17 +116,14 @@ def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
         while True:
             chunk = r.read(1<<20)
-            if not chunk:
-                break
+            if not chunk: break
             f.write(chunk)
 
 def _escape_for_subtitles(path: str) -> str:
-    # Escape backslashes and colons for ffmpeg subtitles filter
     # https://ffmpeg.org/ffmpeg-filters.html#subtitles-1
     return path.replace("\\", "\\\\").replace(":", "\\:")
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
-    # Use libass subtitles with custom fonts dir and default MREARLN style
     fonts_dir = "/usr/local/share/fonts/custom"
     base_style = "FontName=MREARLN,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
@@ -83,36 +137,33 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         out_path
     ]
     try:
-        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
-        raise RuntimeError(f"ffmpeg failed.\nFilter:\n{flt}\n\nStderr:\n{err}") from None
+        raise RuntimeError(f"ffmpeg failed.\nFilter:\n{flt}\n\nStderr:\n{err}")
 
 def handler(event):
     """
     Input:
       {
         "job_id": "20250920-xyz",
-        "video_url": "https://...mp4"   (optional: produce captioned.mp4),
-        "style": "Fontsize=24,PrimaryColour=&H00FFFFFF" (optional)
+        "video_url": "https://...mp4",   # optional
+        "style": "Fontsize=24,PrimaryColour=&H00FFFFFF"  # optional
       }
-    Output:
-      {
-        "srt_key": "...",
-        "srt_url": "...",
-        "captioned_key": "...",      (if video_url provided)
-        "captioned_url": "..."
-      }
+    Output: SRT upload (always) and optional MP4 with burned captions.
     """
     inp = event.get("input") or {}
     job_id = inp.get("job_id")
     if not job_id:
         raise RuntimeError("job_id is required")
 
-    # 1) Find transcripts/timestamped.txt on AWS S3
+    # 1) Find transcript on S3 (accept several filenames)
     ts_key = _key(job_id, "transcripts", "timestamped.txt")
-    # allow a fallback name if upstream differs
-    candidates = [ts_key, _key(job_id, "transcripts", "timestamps.txt")]
+    candidates = [
+        ts_key,
+        _key(job_id, "transcripts", "timestamps.txt"),
+        _key(job_id, "transcripts", "captions.txt"),   # <--- NEW fallback
+    ]
     found = None
     for k in candidates:
         try:
@@ -121,7 +172,7 @@ def handler(event):
         except Exception:
             continue
     if not found:
-        raise RuntimeError(f"timestamped.txt not found at s3://{AWS_S3_BUCKET}/{ts_key}")
+        raise RuntimeError(f"Transcript file not found; tried: {', '.join(candidates)}")
 
     ts_local = _download_s3_key_to_tmp(found)
 

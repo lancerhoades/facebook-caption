@@ -1,35 +1,18 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg-info/
-.venv/
-env/
-
-# VCS / CI
+# Keep only what's needed for the image
+*
+!Dockerfile
+!requirements.txt
+!handler.py
+!caption.py
+!fonts/
+# Always ignore these
 .git/
-.gitignore
-.github/
-
-# OS/editor
-.DS_Store
-*.swp
-
-# Outputs & media
-transcripts/
-output/
+__pycache__/
 *.mp4
-*.wav
-*.webm
+*.mov
+*.avi
+*.zip
 *.tar
-.output-image/
-*.log
-
-# Node
-node_modules/
-
-# Build dists
-build/
-dist/
+*.tar.gz
+_bak/
 facebook-caption/
