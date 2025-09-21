@@ -1,6 +1,6 @@
 # Stable base (Debian 12/bookworm)
 FROM python:3.11-slim-bookworm
-ARG BUILD_REV=1758414088
+ARG BUILD_REV=1758416256
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
