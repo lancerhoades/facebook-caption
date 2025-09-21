@@ -6,25 +6,34 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     IMAGEMAGICK_BINARY=/usr/bin/convert
 
-# System deps: ffmpeg (with libass), libass9, fontconfig (fc-cache), a fallback font, ImageMagick, certs
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates \
- && ln -sf /usr/bin/convert /usr/local/bin/convert \
- && rm -rf /var/lib/apt/lists/*
+# [STEP 1] OS deps (ffmpeg has libass); libass9 just to be explicit; fontconfig + fallback fonts
+RUN set -eux; \
+    echo "[STEP 1] apt-get install"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates; \
+    ln -sf /usr/bin/convert /usr/local/bin/convert; \
+    rm -rf /var/lib/apt/lists/*; \
+    echo "[STEP 1 DONE]"
 
 WORKDIR /app
 
-# Python deps first
+# [STEP 2] Python deps (print progress around pip)
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0 \
- && pip install --no-cache-dir -r requirements.txt
+RUN set -eux; \
+    echo "[STEP 2] pip upgrade"; \
+    python -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.44.0; \
+    echo "[STEP 2a] pip install -r requirements.txt (prefer wheels)"; \
+    pip install --only-binary=:all: --no-cache-dir -r requirements.txt || \
+    (echo "[STEP 2a fallback] retry without wheels-only" && pip install --no-cache-dir -r requirements.txt); \
+    echo "[STEP 2 DONE]"
 
-# App code
+# [STEP 3] App code
 COPY caption.py handler.py ./
 
-# Fonts: copy all and rebuild cache
+# [STEP 4] Fonts and cache
 COPY fonts/ /usr/local/share/fonts/custom/
-RUN fc-cache -f -v || true
+RUN set -eux; echo "[STEP 4] fc-cache"; fc-cache -f -v || true; echo "[STEP 4 DONE]"
 
-# Entrypoint for RunPod
+# [STEP 5] Entrypoint
 ENTRYPOINT ["python", "-u", "handler.py"]
