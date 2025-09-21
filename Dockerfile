@@ -11,8 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN set -eux; \
     echo "[STEP 1] apt-get install"; \
     apt-get update; \
-    apt-get install -y --no-install-recommends gawk \
-        ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates gawk; \
+    apt-get install -y --no-install-recommends \
+        gawk ffmpeg libass9 fontconfig fonts-dejavu-core imagemagick ca-certificates; \
     ln -sf /usr/bin/convert /usr/local/bin/convert; \
     rm -rf /var/lib/apt/lists/*; \
     echo "[STEP 1 DONE]"
