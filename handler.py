@@ -1,4 +1,4 @@
-import os, re, json, tempfile, subprocess, asyncio, aiohttp, boto3
+import os, re, json, tempfile, subprocess, urllib.request, boto3
 from botocore.client import Config
 import runpod
 
@@ -55,29 +55,38 @@ def _has_ffmpeg() -> bool:
     from shutil import which
     return which("ffmpeg") is not None and which("ffprobe") is not None
 
-async def _download_url_to(path: str, url: str):
-    timeout = aiohttp.ClientTimeout(total=None)
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        async with sess.get(url) as r:
-            r.raise_for_status()
-            with open(path, "wb") as f:
-                async for chunk in r.content.iter_chunked(1<<20):
-                    f.write(chunk)
+def _download_url_to(path: str, url: str):
+    with urllib.request.urlopen(url) as r, open(path, "wb") as f:
+        while True:
+            chunk = r.read(1<<20)
+            if not chunk:
+                break
+            f.write(chunk)
+
+def _escape_for_subtitles(path: str) -> str:
+    # Escape backslashes and colons for ffmpeg subtitles filter
+    # https://ffmpeg.org/ffmpeg-filters.html#subtitles-1
+    return path.replace("\\", "\\\\").replace(":", "\\:")
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
-    # Use ffmpeg subtitles filter; style is optional (libass). Keep simple for portability.
-    flt = f"subtitles='{srt_path}'"
-    if style:
-        style = style.replace("'", "").replace('"', "")
-        flt = f"subtitles='{srt_path}':force_style='{style}'"
+    # Use libass subtitles with custom fonts dir and default MREARLN style
+    fonts_dir = "/usr/local/share/fonts/custom"
+    base_style = "FontName=MREARLN,Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
+    eff_style = (style.strip() if style else base_style)
+    srt_esc = _escape_for_subtitles(srt_path)
+    flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={eff_style}"
     cmd = [
-        "ffmpeg","-hide_banner","-y",
+        "ffmpeg","-hide_banner","-loglevel","verbose","-y",
         "-i", video_path,
         "-vf", flt,
         "-c:a","copy",
         out_path
     ]
-    subprocess.check_call(cmd)
+    try:
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
+        raise RuntimeError(f"ffmpeg failed.\nFilter:\n{flt}\n\nStderr:\n{err}") from None
 
 def handler(event):
     """
@@ -125,14 +134,14 @@ def handler(event):
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
-    # 4) Optional: burn-in
+    # 4) Optional: burn-in video captions
     video_url = inp.get("video_url")
     style     = inp.get("style")
     if video_url:
         if not _has_ffmpeg():
             raise RuntimeError("ffmpeg not present in image; omit video_url to only build SRT.")
         vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
-        asyncio.get_event_loop().run_until_complete(_download_url_to(vid_local, video_url))
+        _download_url_to(vid_local, video_url)
         out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
         _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
         cap_key = _key(job_id, "captions", "captioned.mp4")
