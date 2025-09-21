@@ -11,4 +11,3 @@ httpcore==1.0.5
 requests==2.32.3
 boto3==1.34.122
 
-moviepy==1.0.3
