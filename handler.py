@@ -23,7 +23,7 @@ print(f"[CFG] FASTWH id={FASTWH_ID} trans={FASTWH_TRANS} vad={FASTWH_VAD} word_t
 # OpenAI fallback
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FALLBACK_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
-print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET} region={AWS_REGION} OPENAI_KEY={set if OPENAI_API_KEY else missing}")
+print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r} OPENAI_KEY={'set' if OPENAI_API_KEY else 'missing'}")
 
 # Caption styling & chunking controls
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
@@ -56,9 +56,11 @@ def _upload_tmp_to_s3(path: str, key: str, content_type: str | None = None) -> d
 
 # --------- utils ---------
 def _has_ffmpeg() -> bool:
-print("[BOOT] ffmpeg present:", _has_ffmpeg())
     from shutil import which
     return which("ffmpeg") is not None and which("ffprobe") is not None
+
+# log after it's defined (no recursion)
+print("[BOOT] ffmpeg present:", _has_ffmpeg())
 
 def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
@@ -421,7 +423,7 @@ def handler(event):
 
 try:
     print('[BOOT] starting runpod serverless...')
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": _safe_handler})
 except Exception as e:
     import traceback, time
     print('[BOOT][FATAL] runpod start failed:', e)
@@ -438,4 +440,4 @@ def _safe_handler(event):
         traceback.print_exc()
         return {"error": str(e)}
 
-runpod.serverless.start({"handler": _safe_handler})
+
