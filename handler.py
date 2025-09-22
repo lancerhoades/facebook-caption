@@ -1,10 +1,9 @@
 import traceback
-import os, re, json, tempfile, subprocess, urllib.request, boto3, requests, shlex, pathlib
+import os, re, json, tempfile, subprocess, urllib.request, boto3, requests, pathlib
 from botocore.client import Config
 import runpod
 
 print("[BOOT] importing handler.py")
-
 
 # --------- ENV ---------
 AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
@@ -27,8 +26,9 @@ print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r} OPENAI_KEY={'set
 
 # Caption styling & chunking controls
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
-MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # 0 = disabled
-MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))     # 0 = no cap; seconds
+# IMPORTANT: these must be plain numbers in env (e.g., "5"), not "5 # comment"
+MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))
+MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))
 
 if not AWS_S3_BUCKET:
     raise RuntimeError("AWS_S3_BUCKET is required")
@@ -43,12 +43,6 @@ def _key(job_id: str, *parts: str) -> str:
 def _presign(key: str, expires=7*24*3600) -> str:
     return s3.generate_presigned_url("get_object", Params={"Bucket": AWS_S3_BUCKET, "Key": key}, ExpiresIn=expires)
 
-def _download_s3_key_to_tmp(key: str) -> str:
-    fd, path = tempfile.mkstemp(prefix="cap_", suffix=os.path.basename(key).replace("/", "_"))
-    os.close(fd)
-    s3.download_file(AWS_S3_BUCKET, key, path)
-    return path
-
 def _upload_tmp_to_s3(path: str, key: str, content_type: str | None = None) -> dict:
     extra = {"ContentType": content_type} if content_type else {}
     s3.upload_file(path, AWS_S3_BUCKET, key, ExtraArgs=extra)
@@ -59,14 +53,14 @@ def _has_ffmpeg() -> bool:
     from shutil import which
     return which("ffmpeg") is not None and which("ffprobe") is not None
 
-# log after it's defined (no recursion)
 print("[BOOT] ffmpeg present:", _has_ffmpeg())
 
 def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
         while True:
             chunk = r.read(1<<20)
-            if not chunk: break
+            if not chunk:
+                break
             f.write(chunk)
 
 def _escape_for_subtitles(path: str) -> str:
@@ -74,7 +68,6 @@ def _escape_for_subtitles(path: str) -> str:
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
     fonts_dir = "/usr/local/share/fonts/custom"
-    # Use the *family* name (see: fc-list). Default is MisterEarl BT.
     base_style = f"FontName={FONT_FAMILY},Fontsize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
     fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
@@ -93,15 +86,12 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         err = e.stderr.decode("utf-8", "ignore") if e.stderr else str(e)
         raise RuntimeError(f"ffmpeg failed.\nFilter:\n{flt}\n\nStderr:\n{err}")
 
-# --------- transcription paths ---------
+# --------- transcription helpers ---------
 def _timestamped_txt_to_srt(txt_path: str, srt_path: str):
-    # supports:
-    #  (A) "12.34 --> 15.67\ntext"
-    #  (B) "00:00:12.340 --> 00:00:15.670\ntext"
     pat_secs = re.compile(r"^\s*(?P<s>\d+(?:\.\d+)?)\s*-->\s*(?P<e>\d+(?:\.\d+)?)\s*$")
     pat_hms  = re.compile(r"^\s*(?P<s>\d\d:\d\d:\d\d\.\d{3})\s*-->\s*(?P<e>\d\d:\d\d:\d\d\.\d{3})\s*$")
     def _fmt_hms(t):
-        ms_total = int(round(float(t)*1000)) if isinstance(t,(int,float)) or t.replace('.','',1).isdigit() else None
+        ms_total = int(round(float(t)*1000)) if isinstance(t,(int,float)) or (isinstance(t,str) and t.replace('.','',1).isdigit()) else None
         if ms_total is None:
             hh,mm,rest=t.split(":"); ss,mmm=rest.split(".")
             ms_total=(int(hh)*3600+int(mm)*60+int(ss))*1000+int(mmm)
@@ -117,24 +107,23 @@ def _timestamped_txt_to_srt(txt_path: str, srt_path: str):
             s=m.group("s"); e=m.group("e")
             text=lines[i+1].strip()
             out.append((idx, s, e, text)); idx+=1; i+=2
-            if i < len(lines) and not lines[i].strip(): i+=1
+            if i < len(lines) and not lines[i].strip():
+                i+=1
         else:
             i+=1
-    if not out: raise RuntimeError("No caption lines found to convert to SRT.")
+    if not out:
+        raise RuntimeError("No caption lines found to convert to SRT.")
     with open(srt_path,"w",encoding="utf-8") as f:
         for i,s,e,t in out:
             f.write(f"{i}\n{_fmt_hms(s)} --> {_fmt_hms(e)}\n{t}\n\n")
 
 def _vtt_to_srt(vtt: str) -> str:
     lines = [ln.rstrip("\n") for ln in vtt.splitlines()]
-    out = []
-    idx = 1
-    buf = []
+    out = []; idx = 1; buf = []
     def flush_block():
         nonlocal idx
-        if not buf: return
-        # buf[0] should be the timeline line like 00:00:01.000 --> 00:00:02.500
-        # Convert dots to commas on the timeline only.
+        if not buf:
+            return
         tl = buf[0].replace(".", ",")
         out.append(str(idx)); idx += 1
         out.append(tl)
@@ -147,7 +136,6 @@ def _vtt_to_srt(vtt: str) -> str:
         if s == "WEBVTT" or s.startswith("NOTE"):
             continue
         if "-->" in s:
-            # start of a new cue
             flush_block()
             buf.append(s)
         elif s == "":
@@ -156,32 +144,20 @@ def _vtt_to_srt(vtt: str) -> str:
             buf.append(ln)
     flush_block()
     return "\n".join(out) + "\n"
+
 # --------- FastWhisper endpoint call ---------
 def _fastwh_to_srt(video_url: str) -> str:
-    """
-    Calls RunPod FastWhisper endpoint and returns the SRT text.
-    Requires: RUNPOD_API_KEY, RUNPOD_FASTWHISPER_ENDPOINT_ID
-    """
     if not (RUNPOD_API_KEY and FASTWH_ID):
         raise RuntimeError("RUNPOD_API_KEY and RUNPOD_FASTWHISPER_ENDPOINT_ID are required to use FastWhisper endpoint.")
-
     url = f"https://api.runpod.ai/v2/{FASTWH_ID}/runsync"
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type":"application/json"}
-    payload = {
-        "input": {
-            "audio": video_url,          # the worker can fetch from S3
-            "transcription": "srt",   # expect "srt"
-            "enable_vad": FASTWH_VAD,
-            "word_timestamps": FASTWH_WORDTS,
-            **({"language": LANG_HINT} if LANG_HINT else {})
-        }
-    }
+    payload = {"input": {"audio": video_url, "transcription": "srt", "enable_vad": FASTWH_VAD, "word_timestamps": FASTWH_WORDTS}}
+    if LANG_HINT:
+        payload["input"]["language"] = LANG_HINT
     print("[FASTWH] payload:", json.dumps(payload)[:500])
-
     r = requests.post(url, headers=headers, json=payload, timeout=600)
     r.raise_for_status()
     data = r.json()
-    
     print(f"[FASTWH] status={r.status_code} url={url}")
     try:
         body_snip = (r.text or "")[:1000].replace("\n"," ")
@@ -189,111 +165,42 @@ def _fastwh_to_srt(video_url: str) -> str:
         print("[FASTWH] headers:", {k:v for k,v in list(r.headers.items())[:6]})
     except Exception as _e:
         print("[FASTWH] log-exc:", _e)
-    print("[FASTWH] json keys:", list((data or {}).keys()))
-    outv = (data or {}).get("output")
-    print("[FASTWH] output type:", type(outv), "keys:", (list(outv.keys()) if isinstance(outv, dict) else None))
 
-    out = data.get("output") or {}
-    # Accept common shapes from Faster Whisper Hub
+    out = data.get("output")
+    # accept various shapes
     if isinstance(out, dict):
+        if isinstance(out.get("srt"), str) and "-->" in out["srt"]:
+            return out["srt"]
         tx = out.get("transcription")
         if isinstance(tx, str):
-            if "-->" in tx:           # SRT-looking
+            if "-->" in tx:
                 return tx
             if tx.lstrip().startswith("WEBVTT"):
                 return _vtt_to_srt(tx)
-        # some templates expose explicit keys too
-        if isinstance(out.get("srt"), str) and "-->" in out["srt"]:
-            return out["srt"]
         if isinstance(out.get("vtt"), str) and out["vtt"].lstrip().startswith("WEBVTT"):
             return _vtt_to_srt(out["vtt"])
     if isinstance(out, str):
+        if out.lstrip().startswith("WEBVTT"):
+            return _vtt_to_srt(out)
         return out
-    if isinstance(out, dict):
-        # typical keys: "srt", "vtt", "text", "segments" depending on template
-        if "srt" in out and isinstance(out["srt"], str):
-            return out["srt"]
-        if "text_srt" in out and isinstance(out["text_srt"], str):
-            return out["text_srt"]
-        if "text" in out and isinstance(out["text"], str) and "-->" in out["text"]:
-            return out["text"]  # already srt-like
-    if isinstance(out, dict) and "vtt" in out and isinstance(out["vtt"], str):
-        return _vtt_to_srt(out["vtt"])
 
-    if isinstance(out, str) and out.lstrip().startswith("WEBVTT"):
-        return _vtt_to_srt(out)
+    # top-level fallback keys
+    if isinstance(data.get("srt"), str) and "-->" in data["srt"]:
+        return data["srt"]
+    if isinstance(data.get("vtt"), str) and data["vtt"].lstrip().startswith("WEBVTT"):
+        return _vtt_to_srt(data["vtt"])
+    # common nesting: {"data":{"srt": "..."}}
+    nest = data.get("data")
+    if isinstance(nest, dict):
+        if isinstance(nest.get("srt"), str) and "-->" in nest["srt"]:
+            return nest["srt"]
+        if isinstance(nest.get("vtt"), str) and nest["vtt"].lstrip().startswith("WEBVTT"):
+            return _vtt_to_srt(nest["vtt"])
 
-    if isinstance(data, dict):
-        if isinstance(data.get("vtt"), str):
-            return _vtt_to_srt(data["vtt"])
-        if isinstance(data.get("srt"), str):
-            return data["srt"]
-
-    import textwrap
-    try:
-        body_snip = textwrap.shorten(r.text.replace("\n"," "), width=600, placeholder=" ... ")
-        print("[FASTWH] raw body snippet:", body_snip)
-    except Exception:
-        pass
-
-    if isinstance(out, dict) and "vtt" in out and isinstance(out["vtt"], str):
-        return _vtt_to_srt(out["vtt"])
-
-    if isinstance(out, str) and out.lstrip().startswith("WEBVTT"):
-        return _vtt_to_srt(out)
-
-    if isinstance(data, dict):
-        if isinstance(data.get("vtt"), str):
-            return _vtt_to_srt(data["vtt"])
-        if isinstance(data.get("srt"), str):
-            return data["srt"]
-
-    import textwrap
-    try:
-        body_snip = textwrap.shorten(r.text.replace("\n"," "), width=600, placeholder=" ... ")
-        print("[FASTWH] raw body snippet:", body_snip)
-    except Exception:
-        pass
-
-    # Lenient fallbacks for odd templates
-
-    if isinstance(data, dict):
-
-        # direct top-level srt/vtt
-
-        if isinstance(data.get("srt"), str) and "-->" in data["srt"]:
-
-            return data["srt"]
-
-        if isinstance(data.get("vtt"), str) and data["vtt"].lstrip().startswith("WEBVTT"):
-
-            return _vtt_to_srt(data["vtt"])
-
-        # common nesting: data.get("data", {}).get("srt")
-
-        nest = data.get("data") or {}
-
-        if isinstance(nest, dict):
-
-            if isinstance(nest.get("srt"), str) and "-->" in nest["srt"]:
-
-                return nest["srt"]
-
-            if isinstance(nest.get("vtt"), str) and nest["vtt"].lstrip().startswith("WEBVTT"):
-
-                return _vtt_to_srt(nest["vtt"])
-
-
-    raise RuntimeError(f"FastWhisper response did not contain SRT text. Output keys: {list(out.keys()) if isinstance(out,dict) else type(out)}")
+    raise RuntimeError("FastWhisper response did not contain SRT text.")
 
 # --------- OpenAI fallback (plain whisper) ---------
-
-# --------- main handler ---------
 def _openai_to_txt(video_path: str) -> str:
-    """
-    Fallback: use caption.py (OpenAI Whisper) to produce timestamped TXT,
-    then we convert to SRT. Logged so failures aren\x27t silent.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No RUNPOD endpoint available and OPENAI_API_KEY missing for fallback.")
     here = pathlib.Path(__file__).parent.resolve()
@@ -312,17 +219,9 @@ def _openai_to_txt(video_path: str) -> str:
         raise RuntimeError("Fallback transcriber ran but no transcripts/*-captions.txt found.")
     return open(guess[0], "r", encoding="utf-8").read()
 
+# --------- main handler ---------
 def handler(event):
-    """
-    Input:
-      {
-        "job_id": "20250920-xyz",
-        "video_url": "https://...mp4",      # REQUIRED now
-        "style": "Fontsize=24,PrimaryColour=&H00FFFFFF"  # optional
-      }
-    Output: SRT upload and MP4 with burned captions.
-    """
-    inp = event.get("input") or {}
+    inp = (event or {}).get("input") or {}
     job_id = inp.get("job_id")
     video_url = inp.get("video_url")
     style     = inp.get("style")
@@ -331,37 +230,36 @@ def handler(event):
     if not video_url:
         raise RuntimeError("video_url is required")
 
-    # 1) download video
+    # 1) download video (only needed for fallback + trimming)
     vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
     _download_url_to(vid_local, video_url)
 
-    # 2) get SRT text (prefer FastWhisper endpoint)
+    # 2) get SRT text
     try:
         srt_text = _fastwh_to_srt(video_url)
     except Exception as e:
-        # fallback to OpenAI Whisper
         srt_text = None
         try:
-            txt_text = _openai_to_txt(vid_local)      # seconds-based caption blocks
-            # convert that to SRT
+            txt_text = _openai_to_txt(vid_local)
             txt_fd, txt_local = tempfile.mkstemp(prefix="captions_", suffix=".txt"); os.close(txt_fd)
-            with open(txt_local,"w",encoding="utf-8") as f: f.write(txt_text)
-            srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
-            _timestamped_txt_to_srt(txt_local, srt_local)
-            srt_text = open(srt_local,"r",encoding="utf-8").read()
+            with open(txt_local,"w",encoding="utf-8") as f:
+                f.write(txt_text)
+            srt_fd, srt_local_tmp = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
+            _timestamped_txt_to_srt(txt_local, srt_local_tmp)
+            srt_text = open(srt_local_tmp,"r",encoding="utf-8").read()
         except Exception as e2:
             raise RuntimeError(f"Transcription failed. Endpoint error: {e}. Fallback error: {e2}")
 
     # 3) write SRT to tmp
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
-    with open(srt_local,"w",encoding="utf-8") as f: f.write(srt_text)
+    with open(srt_local,"w",encoding="utf-8") as f:
+        f.write(srt_text)
 
-    # 3a) (optional) trim SRT to video duration to avoid tail overrun
+    # 3a) trim SRT to video duration (best effort)
     try:
         dur = subprocess.check_output(
             ["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", vid_local],
-            text=True
-        ).strip()
+            text=True).strip()
         DUR = float(dur)
         trimmed = []
         block=[]
@@ -387,20 +285,19 @@ def handler(event):
                             trimmed.append("\n".join(blk))
                     block=[]
         if trimmed:
-            with open(srt_local,"w",encoding="utf-8") as f: f.write("\n\n".join(trimmed) + "\n\n")
+            with open(srt_local,"w",encoding="utf-8") as f:
+                f.write("\n\n".join(trimmed) + "\n\n")
     except Exception:
         pass
 
     # 4) upload SRT
     srt_key = _key(job_id, "captions", "captions.srt")
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
-
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
-    # 4a) optional: chunkify SRT into short, fast-moving cues for reels
+    # 4a) optional: chunkify SRT
     try:
         if MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0:
-            import tempfile, subprocess, os
             tmp_fd, tuned_srt = tempfile.mkstemp(prefix="captions_tuned_", suffix=".srt"); os.close(tmp_fd)
             awk = "/app/tools/srt_chunkify.awk"
             cmd = ["awk", f"-vW={MAX_WORDS_PER_CU}", f"-vD={MAX_CUE_DURATION}", "-f", awk, srt_local]
@@ -418,11 +315,7 @@ def handler(event):
     cap_key = _key(job_id, "captions", "captioned.mp4")
     up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
     result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
-
     return result
-
-try:
-
 
 def _safe_handler(event):
     try:
@@ -431,8 +324,6 @@ def _safe_handler(event):
         print("[FATAL]", e)
         traceback.print_exc()
         return {"error": str(e)}
-
-
 
 if __name__ == "__main__":
     print('[BOOT] starting runpod serverless...')
