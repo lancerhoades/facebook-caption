@@ -422,14 +422,6 @@ def handler(event):
     return result
 
 try:
-    print('[BOOT] starting runpod serverless...')
-    runpod.serverless.start({"handler": _safe_handler})
-except Exception as e:
-    import traceback, time
-    print('[BOOT][FATAL] runpod start failed:', e)
-    traceback.print_exc()
-    # keep container alive a bit so the platform can read logs
-    time.sleep(300)
 
 
 def _safe_handler(event):
@@ -441,3 +433,7 @@ def _safe_handler(event):
         return {"error": str(e)}
 
 
+
+if __name__ == "__main__":
+    print('[BOOT] starting runpod serverless...')
+    runpod.serverless.start({"handler": _safe_handler})
