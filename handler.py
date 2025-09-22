@@ -3,6 +3,9 @@ import os, re, json, tempfile, subprocess, urllib.request, boto3, requests, shle
 from botocore.client import Config
 import runpod
 
+print("[BOOT] importing handler.py")
+
+
 # --------- ENV ---------
 AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
 AWS_S3_BUCKET  = os.getenv("AWS_S3_BUCKET")
@@ -416,7 +419,16 @@ def handler(event):
 
     return result
 
-runpod.serverless.start({"handler": handler})
+try:
+    print('[BOOT] starting runpod serverless...')
+    runpod.serverless.start({"handler": handler})
+except Exception as e:
+    import traceback, time
+    print('[BOOT][FATAL] runpod start failed:', e)
+    traceback.print_exc()
+    # keep container alive a bit so the platform can read logs
+    time.sleep(300)
+
 
 def _safe_handler(event):
     try:
