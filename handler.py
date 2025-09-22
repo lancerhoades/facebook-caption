@@ -1,3 +1,4 @@
+import traceback
 import os, re, json, tempfile, subprocess, urllib.request, boto3, requests, shlex, pathlib
 from botocore.client import Config
 import runpod
@@ -19,6 +20,7 @@ print(f"[CFG] FASTWH id={FASTWH_ID} trans={FASTWH_TRANS} vad={FASTWH_VAD} word_t
 # OpenAI fallback
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FALLBACK_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
+print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET} region={AWS_REGION} OPENAI_KEY={set if OPENAI_API_KEY else missing}")
 
 # Caption styling & chunking controls
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
@@ -51,6 +53,7 @@ def _upload_tmp_to_s3(path: str, key: str, content_type: str | None = None) -> d
 
 # --------- utils ---------
 def _has_ffmpeg() -> bool:
+print("[BOOT] ffmpeg present:", _has_ffmpeg())
     from shutil import which
     return which("ffmpeg") is not None and which("ffprobe") is not None
 
@@ -414,3 +417,13 @@ def handler(event):
     return result
 
 runpod.serverless.start({"handler": handler})
+
+def _safe_handler(event):
+    try:
+        return handler(event)
+    except Exception as e:
+        print("[FATAL]", e)
+        traceback.print_exc()
+        return {"error": str(e)}
+
+runpod.serverless.start({"handler": _safe_handler})
