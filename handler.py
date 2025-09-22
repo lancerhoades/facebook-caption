@@ -132,77 +132,155 @@ def _segments_to_srt(segments) -> str:
     return ("\n".join(out) + "\n") if out else ""
 
 # --------- FastWhisper (FORCE SRT) ---------
+# --------- FastWhisper (FORCE SRT; run + poll) ---------
 def _fastwh_to_srt(video_url: str) -> str:
-    url = f"https://api.runpod.ai/v2/{FASTWH_ID}/runsync"
-    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type":"application/json"}
-    # Hardcode transcription="srt" — per worker docs.
-    payload = {"input": {
-        "audio": video_url,
+    """
+    Submit a run to Faster-Whisper and poll until COMPLETED.
+    Handles endpoints that return IN_QUEUE/IN_PROGRESS to /runsync.
+    """
+    base = f"https://api.runpod.ai/v2/{FASTWH_ID}"
+    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
+
+    # Configurable polling
+    POLL_S = float(os.getenv("FASTWH_POLL_SECONDS", "5"))             # seconds between polls
+    MAX_WAIT_S = int(os.getenv("FASTWH_MAX_WAIT_SECONDS", "3600"))    # 1h total
+    CONNECT_TIMEOUT_S = int(os.getenv("FASTWH_CONNECT_TIMEOUT", "20"))
+    READ_TIMEOUT_S = int(os.getenv("FASTWH_READ_TIMEOUT", "600"))
+
+    def _req(method, path, **kw):
+        kw.setdefault("timeout", (CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
+        r = requests.request(method, f"{base}{path}", headers=headers, **kw)
+        r.raise_for_status()
+        return r.json()
+
+    # Build input payload (force SRT)
+    base_input = {
         "transcription": "srt",
         "enable_vad": FASTWH_VAD,
-        "word_timestamps": FASTWH_WORDTS
-    }}
+        "word_timestamps": FASTWH_WORDTS,
+    }
     if LANG_HINT:
-        payload["input"]["language"] = LANG_HINT
+        base_input["language"] = LANG_HINT
 
-    r = requests.post(url, headers=headers, json=payload, timeout=600)
-    r.raise_for_status()
-    try:
-        print("[FASTWH] status=", r.status_code)
-        print("[FASTWH] body_snip:", (r.text or "")[:800].replace("\n"," "))
-    except Exception:
-        pass
-    data = r.json()
+    # We'll try "audio" then "audio_url"
+    tried = []
+    for audio_key in ("audio", "audio_url"):
+        tried.append(audio_key)
+        payload = {"input": dict(base_input, **{audio_key: video_url})}
+        try:
+            # Redacted logging
+            safe_payload = dict(payload)
+            try:
+                # don't spam logs with huge urls
+                p_in = dict(safe_payload["input"])
+                if isinstance(p_in.get(audio_key), str) and len(p_in[audio_key]) > 128:
+                    p_in[audio_key] = p_in[audio_key][:128] + "...(trunc)"
+                safe_payload["input"] = p_in
+            except Exception:
+                pass
+            print(f"[FASTWH] POST /run payload={json.dumps(safe_payload, ensure_ascii=False)}")
 
-    # Accept common shapes
-    def maybe_srt(x):
-        if isinstance(x, str):
-            if x.lstrip().startswith("WEBVTT"): return _vtt_to_srt(x)
-            if "-->" in x: return x
-        return None
+            run = _req("POST", "/run", json=payload)     # { id, status, delayTime, ... }
+            run_id = run.get("id")
+            if not run_id:
+                raise RuntimeError(f"/run did not return id. Body: {run}")
 
-    out = data.get("output")
+            print(f"[FASTWH] started id={run_id} status={run.get('status')} delay={run.get('delayTime')} worker={run.get('workerId')}")
 
-    # 1) Direct SRT/VTT at output level
-    if isinstance(out, dict):
-        for k in ("srt", "text_srt", "vtt", "transcription", "text"):
-            srt = maybe_srt(out.get(k))
+            # Poll until COMPLETED/FAILED
+            import time
+            t0 = time.time()
+            last_status = None
+            while True:
+                st = _req("GET", f"/status/{run_id}")
+                status = st.get("status")
+                if status != last_status:
+                    print(f"[FASTWH] poll id={run_id} status={status} delay={st.get('delayTime')} exec={st.get('executionTime')} worker={st.get('workerId')}")
+                    last_status = status
+
+                if status in ("COMPLETED", "COMPLETED_WITH_ERRORS"):
+                    data = st
+                    break
+                if status in ("FAILED", "CANCELLED", "TIMED_OUT", "DEAD"):
+                    raise RuntimeError(f"Run ended {status}: {json.dumps(st)[:800]}")
+
+                if time.time() - t0 > MAX_WAIT_S:
+                    raise RuntimeError(f"Timeout waiting for completion after {MAX_WAIT_S}s. Last: {json.dumps(st)[:800]}")
+
+                time.sleep(POLL_S)
+
+            # Now pull SRT/VTT/segments out of the final status json
+            def maybe_srt(x):
+                if isinstance(x, str):
+                    if x.lstrip().startswith("WEBVTT"):
+                        return _vtt_to_srt(x)
+                    if "-->" in x:
+                        return x
+                return None
+
+            out = data.get("output")
+
+            # output dict -> srt/vtt/text variants
+            if isinstance(out, dict):
+                for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+                    srt = maybe_srt(out.get(k))
+                    if srt: return srt
+                if isinstance(out.get("segments"), list):
+                    srt = _segments_to_srt(out["segments"])
+                    if srt.strip():
+                        print("[FASTWH] built SRT from output.segments")
+                        return srt
+
+            # output list (first element)
+            if isinstance(out, list) and out:
+                first = out[0]
+                if isinstance(first, dict):
+                    for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+                        srt = maybe_srt(first.get(k))
+                        if srt: return srt
+                    if isinstance(first.get("segments"), list):
+                        srt = _segments_to_srt(first["segments"])
+                        if srt.strip():
+                            print("[FASTWH] built SRT from output[0].segments")
+                            return srt
+                else:
+                    srt = maybe_srt(first)
+                    if srt: return srt
+
+            # output as a string
+            srt = maybe_srt(out)
             if srt: return srt
-        # segments → synthesize
-        if isinstance(out.get("segments"), list):
-            srt = _segments_to_srt(out["segments"])
-            if srt.strip():
-                print("[FASTWH] built SRT from output.segments")
-                return srt
 
-    # 2) output is a string
-    srt = maybe_srt(out)
-    if srt: return srt
+            # top-level
+            for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+                srt = maybe_srt(data.get(k))
+                if srt: return srt
+            if isinstance(data.get("segments"), list):
+                srt = _segments_to_srt(data["segments"])
+                if srt.strip():
+                    print("[FASTWH] built SRT from top-level segments")
+                    return srt
 
-    # 3) top-level keys
-    for k in ("srt", "text_srt", "vtt", "transcription", "text"):
-        srt = maybe_srt(data.get(k))
-        if srt: return srt
-    if isinstance(data.get("segments"), list):
-        srt = _segments_to_srt(data["segments"])
-        if srt.strip():
-            print("[FASTWH] built SRT from top-level segments")
-            return srt
+            # nested data
+            nest = data.get("data")
+            if isinstance(nest, dict):
+                for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+                    srt = maybe_srt(nest.get(k))
+                    if srt: return srt
+                if isinstance(nest.get("segments"), list):
+                    srt = _segments_to_srt(nest["segments"])
+                    if srt.strip():
+                        print("[FASTWH] built SRT from data.segments")
+                        return srt
 
-    # 4) common nesting: data.{...}
-    nest = data.get("data")
-    if isinstance(nest, dict):
-        for k in ("srt", "text_srt", "vtt", "transcription", "text"):
-            srt = maybe_srt(nest.get(k))
-            if srt: return srt
-        if isinstance(nest.get("segments"), list):
-            srt = _segments_to_srt(nest["segments"])
-            if srt.strip():
-                print("[FASTWH] built SRT from data.segments")
-                return srt
+            raise RuntimeError(f"COMPLETED but no SRT/VTT/segments in response. Snip: {json.dumps(data)[:800]}")
 
-    snippet = json.dumps(data)[:800] if isinstance(data, dict) else str(data)[:800]
-    raise RuntimeError(f"FastWhisper response did not contain SRT/VTT/segments. Snip: {snippet}")
+        except Exception as e:
+            print(f"[FASTWH] attempt with key={audio_key} failed: {e}")
+            # try next key
+            continue
+
+    raise RuntimeError(f"FastWhisper failed with keys {tried}.")
 
 # --------- main handler ---------
 def handler(event):
