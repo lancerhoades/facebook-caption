@@ -1,5 +1,5 @@
 import traceback
-import os, re, json, tempfile, subprocess, urllib.request, boto3, requests, pathlib
+import os, re, json, tempfile, subprocess, urllib.request, urllib.parse, boto3, requests, pathlib
 from botocore.client import Config
 import runpod
 
@@ -263,6 +263,8 @@ def handler(event):
     job_id = inp.get("job_id")
     video_url = inp.get("video_url")
     style     = inp.get("style")
+    output_key = inp.get("output_key")
+    burn = bool(inp.get("burn", False))
     if not job_id:
         raise RuntimeError("job_id is required")
     if not video_url:
@@ -317,7 +319,7 @@ def handler(event):
         pass
 
     # Upload SRT
-    srt_key = _key(job_id, "captions", "captions.srt")
+    srt_key = output_key if output_key else _key(job_id, "captions", "captions.srt")
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
@@ -333,12 +335,14 @@ def handler(event):
     except Exception as _e:
         print("[CHUNKIFY] Skipped (no awk or error):", _e)
 
+    if not burn:
+        return result
     # Burn-in captions
     if not _has_ffmpeg():
         raise RuntimeError("ffmpeg not present in image; cannot burn captions.")
     out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
     _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
-    cap_key = _key(job_id, "captions", "captioned.mp4")
+    cap_key = _key(job_id, "reels", f"{pathlib.Path(srt_key).stem}.mp4")
     up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
     result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
     return result
