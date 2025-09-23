@@ -319,7 +319,7 @@ def handler(event):
     video_url = inp.get("video_url")
     style     = inp.get("style")
     output_key = inp.get("output_key")   # optional: where to put the SRT
-    burn      = bool(inp.get("burn", False))
+    burn      = bool(inp.get("burn", True))
 
     if not job_id:
         raise RuntimeError("job_id is required")
