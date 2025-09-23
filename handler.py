@@ -1,6 +1,7 @@
 import traceback
-import os, re, json, tempfile, subprocess, urllib.request, urllib.parse, boto3, requests, pathlib
+import os, re, json, tempfile, subprocess, urllib.request, urllib.parse, unicodedata, pathlib
 from botocore.client import Config
+import boto3, requests
 import runpod
 
 print("[BOOT] importing handler.py")
@@ -16,9 +17,10 @@ FASTWH_VAD     = os.getenv("FASTWH_ENABLE_VAD", "true").lower() in ("1","true","
 FASTWH_WORDTS  = os.getenv("FASTWH_WORD_TIMESTAMPS", "true").lower() in ("1","true","yes","on")
 LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None  # optional, e.g. "en"
 
+# Caption styling (ASS force_style)
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
-MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))
-MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))
+MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt reflow (awk)
+MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))    # optional srt reflow (awk)
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
@@ -61,15 +63,39 @@ def _download_url_to(path: str, url: str):
 def _escape_for_subtitles(path: str) -> str:
     return path.replace("\\", "\\\\").replace(":", "\\:")
 
-def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None):
+def _slugify(text: str, max_len: int = 64) -> str:
+    t = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    t = t.lower()
+    t = re.sub(r"[’'`]", "-", t)
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return (t[:max_len] or "caption")
+
+def _write_single_block_srt(path: str, duration_s: float, text: str):
+    ms = int(round(max(0.1, duration_s) * 1000))
+    hh, rem = divmod(ms, 3600_000)
+    mm, rem = divmod(rem, 60_000)
+    ss, mmm = divmod(rem, 1000)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("1\n")
+        f.write(f"00:00:00,000 --> {hh:02d}:{mm:02d}:{ss:02d},{mmm:03d}\n")
+        f.write(text.strip() + "\n\n")
+
+def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None,
+                          start_s: float | None = None, end_s: float | None = None):
     fonts_dir = "/usr/local/share/fonts/custom"
     base_style = f"FontName={FONT_FAMILY},Fontsize=30,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2"
     eff_style = (style.strip() if style else base_style)
     fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
     srt_esc = _escape_for_subtitles(srt_path)
     flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={fs_esc}"
-    cmd = [
-        "ffmpeg","-hide_banner","-loglevel","error","-stats","-threads","1","-y",
+
+    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-stats","-threads","1","-y"]
+    # Trim window (fast seek before input)
+    if start_s is not None:
+        cmd += ["-ss", f"{float(start_s):.3f}"]
+    if end_s is not None and start_s is not None:
+        cmd += ["-to", f"{float(end_s):.3f}"]
+    cmd += [
         "-i", video_path,
         "-vf", flt, "-c:v","libx264","-preset","veryfast","-crf","22",
         "-c:a","copy","-movflags","+faststart","-shortest",
@@ -131,7 +157,46 @@ def _segments_to_srt(segments) -> str:
         idx += 1
     return ("\n".join(out) + "\n") if out else ""
 
-# --------- FastWhisper (FORCE SRT) ---------
+def _parse_srt_blocks(srt_text: str):
+    """
+    Return list of (start_s, end_s, text). Robust to multi-line text blocks.
+    """
+    def tosec(hms: str) -> float:
+        hh, mm, ssms = hms.split(":")
+        ss, ms = ssms.split(",")
+        return int(hh)*3600 + int(mm)*60 + int(ss) + int(ms)/1000.0
+
+    blocks = []
+    cur = []
+    for ln in srt_text.splitlines():
+        if ln.strip() == "":
+            if cur:
+                try:
+                    # cur[0] -> index, cur[1] -> "a --> b", rest -> text lines
+                    timeline = cur[1].strip()
+                    a, b = [x.strip() for x in timeline.split("-->")]
+                    start_s = tosec(a); end_s = tosec(b)
+                    text = "\n".join(cur[2:]).strip()
+                    if text:
+                        blocks.append((start_s, end_s, text))
+                except Exception:
+                    pass
+                cur = []
+        else:
+            cur.append(ln.rstrip("\n"))
+    # flush last
+    if cur:
+        try:
+            timeline = cur[1].strip()
+            a, b = [x.strip() for x in timeline.split("-->")]
+            start_s = tosec(a); end_s = tosec(b)
+            text = "\n".join(cur[2:]).strip()
+            if text:
+                blocks.append((start_s, end_s, text))
+        except Exception:
+            pass
+    return blocks
+
 # --------- FastWhisper (FORCE SRT; run + poll) ---------
 def _fastwh_to_srt(video_url: str) -> str:
     """
@@ -139,19 +204,17 @@ def _fastwh_to_srt(video_url: str) -> str:
       input.audio: string (URL)
       input.model: "large-v3"
       input.transcription: "srt"
-    Poll until COMPLETED and return SRT.
+    Poll until COMPLETED and return SRT (or convert VTT).
     """
     base = f"https://api.runpod.ai/v2/{FASTWH_ID}"
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
 
     def _req(method, path, **kw):
-        # conservative timeouts so status polling never hangs this pod
-        kw.setdefault("timeout", (20, 600))
+        kw.setdefault("timeout", (20, 600))  # connect, read
         r = requests.request(method, f"{base}{path}", headers=headers, **kw)
         r.raise_for_status()
         return r.json()
 
-    # ----- STRICT SCHEMA (hardcoded) -----
     payload = {
         "input": {
             "audio": video_url,
@@ -160,43 +223,35 @@ def _fastwh_to_srt(video_url: str) -> str:
         }
     }
 
-    # Log (truncate long URL)
-    safe = json.loads(json.dumps(payload))  # deep copy
+    safe = json.loads(json.dumps(payload))
     if isinstance(safe["input"].get("audio"), str) and len(safe["input"]["audio"]) > 128:
         safe["input"]["audio"] = safe["input"]["audio"][:128] + "...(trunc)"
     print(f"[FASTWH] POST /run payload={json.dumps(safe, ensure_ascii=False)}")
 
-    # Start run
     run = _req("POST", "/run", json=payload)
     run_id = run.get("id")
     print(f"[FASTWH] started id={run_id} status={run.get('status')} delay={run.get('delayTime')} worker={run.get('workerId')}")
     if not run_id:
         raise RuntimeError(f"/run did not return id. Body: {run}")
 
-    # Poll
     import time
-    t0 = time.time()
     last = None
-    POLL_S = 5
-    MAX_WAIT_S = 3600  # 1 hour cap for truly long files
-
+    t0 = time.time()
     while True:
         st = _req("GET", f"/status/{run_id}")
         status = st.get("status")
         if status != last:
             print(f"[FASTWH] poll id={run_id} status={status} delay={st.get('delayTime')} exec={st.get('executionTime')} worker={st.get('workerId')}")
             last = status
-
         if status in ("COMPLETED", "COMPLETED_WITH_ERRORS"):
             data = st
             break
         if status in ("FAILED", "CANCELLED", "TIMED_OUT", "DEAD"):
             raise RuntimeError(f"Run ended {status}: {json.dumps(st)[:800]}")
-        if time.time() - t0 > MAX_WAIT_S:
-            raise RuntimeError(f"Timeout after {MAX_WAIT_S}s. Last: {json.dumps(st)[:800]}")
-        time.sleep(POLL_S)
+        if time.time() - t0 > 3600:
+            raise RuntimeError("Timeout after 3600s.")
+        time.sleep(5)
 
-    # ----- Extract SRT from the final response -----
     def maybe_srt(x):
         if isinstance(x, str):
             if x.lstrip().startswith("WEBVTT"):
@@ -260,11 +315,12 @@ def _fastwh_to_srt(video_url: str) -> str:
 # --------- main handler ---------
 def handler(event):
     inp = (event or {}).get("input") or {}
-    job_id = inp.get("job_id")
+    job_id    = inp.get("job_id")
     video_url = inp.get("video_url")
     style     = inp.get("style")
-    output_key = inp.get("output_key")
-    burn = bool(inp.get("burn", False))
+    output_key = inp.get("output_key")   # optional: where to put the SRT
+    burn      = bool(inp.get("burn", False))
+
     if not job_id:
         raise RuntimeError("job_id is required")
     if not video_url:
@@ -315,6 +371,7 @@ def handler(event):
         if trimmed:
             with open(srt_local,"w",encoding="utf-8") as f:
                 f.write("\n\n".join(trimmed) + "\n\n")
+            srt_text = open(srt_local,"r",encoding="utf-8").read()
     except Exception:
         pass
 
@@ -332,19 +389,43 @@ def handler(event):
             with open(tuned_srt, "w", encoding="utf-8") as outf:
                 subprocess.run(cmd, check=True, stdout=outf)
             srt_local = tuned_srt
+            srt_text = open(srt_local,"r",encoding="utf-8").read()
     except Exception as _e:
         print("[CHUNKIFY] Skipped (no awk or error):", _e)
 
     if not burn:
         return result
-    # Burn-in captions
+
+    # ------- PER-CAPTION MP4s -------
     if not _has_ffmpeg():
         raise RuntimeError("ffmpeg not present in image; cannot burn captions.")
-    out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
-    _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
-    cap_key = _key(job_id, "reels", f"{pathlib.Path(srt_key).stem}.mp4")
-    up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
-    result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
+    blocks = _parse_srt_blocks(srt_text)
+    if not blocks:
+        raise RuntimeError("No caption blocks parsed from SRT.")
+
+    clips = []
+    with tempfile.TemporaryDirectory() as td:
+        for (start_s, end_s, text) in blocks:
+            # Build one-line SRT anchored at t=0..duration, then trim the video to the same window.
+            dur = max(0.1, float(end_s) - float(start_s))
+            slug = _slugify(text)
+            one_srt = os.path.join(td, f"{slug}.srt")
+            _write_single_block_srt(one_srt, dur, text)
+
+            out_local = os.path.join(td, f"{slug}.mp4")
+            _burn_captions_ffmpeg(vid_local, one_srt, out_local, style, start_s=start_s, end_s=end_s)
+
+            cap_key = _key(job_id, "captions", f"{slug}.mp4")
+            up = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
+            clips.append({
+                "key": up["key"],
+                "url": up["url"],
+                "start": float(start_s),
+                "end": float(end_s),
+                "text": text
+            })
+
+    result.update({"clips_count": len(clips), "clips": clips})
     return result
 
 def _safe_handler(event):
