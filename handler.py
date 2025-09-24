@@ -396,36 +396,16 @@ def handler(event):
     if not burn:
         return result
 
-    # ------- PER-CAPTION MP4s -------
-    if not _has_ffmpeg():
-        raise RuntimeError("ffmpeg not present in image; cannot burn captions.")
-    blocks = _parse_srt_blocks(srt_text)
-    if not blocks:
-        raise RuntimeError("No caption blocks parsed from SRT.")
-
-    clips = []
-    with tempfile.TemporaryDirectory() as td:
-        for (start_s, end_s, text) in blocks:
-            # Build one-line SRT anchored at t=0..duration, then trim the video to the same window.
-            dur = max(0.1, float(end_s) - float(start_s))
-            slug = _slugify(text)
-            one_srt = os.path.join(td, f"{slug}.srt")
-            _write_single_block_srt(one_srt, dur, text)
-
-            out_local = os.path.join(td, f"{slug}.mp4")
-            _burn_captions_ffmpeg(vid_local, one_srt, out_local, style, start_s=start_s, end_s=end_s)
-
-            cap_key = _key(job_id, "captions", f"{slug}.mp4")
-            up = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
-            clips.append({
-                "key": up["key"],
-                "url": up["url"],
-                "start": float(start_s),
-                "end": float(end_s),
-                "text": text
-            })
-
-    result.update({"clips_count": len(clips), "clips": clips})
+    # ------- SINGLE MP4 BURN (optional) -------
+    if burn:
+        if not _has_ffmpeg():
+            raise RuntimeError("ffmpeg not present in image; cannot burn captions.")
+        base = pathlib.Path(srt_key).stem if output_key else (pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "captioned")
+        out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
+        _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
+        cap_key = _key(job_id, "reels", f"{base}.mp4")
+        up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
+        result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
     return result
 
 def _safe_handler(event):
