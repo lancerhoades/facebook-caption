@@ -330,10 +330,23 @@ def handler(event):
     vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
     _download_url_to(vid_local, video_url)
 
-    # Transcribe via RunPod (force SRT)
-    srt_text = _fastwh_to_srt(video_url)
-
-    # Write SRT to tmp
+    # Use provided SRT (if any); else transcribe via RunPod (force SRT)
+    srt_text = None
+    srt_url_in  = inp.get("srt_url")
+    srt_text_in = inp.get("srt_text")
+    srt_key_in  = inp.get("srt_key")
+    if srt_text_in:
+        srt_text = srt_text_in
+    elif srt_url_in:
+        with urllib.request.urlopen(srt_url_in) as r:
+            _raw = r.read().decode("utf-8", "ignore")
+            srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
+    elif srt_key_in:
+        obj = s3.get_object(Bucket=AWS_S3_BUCKET, Key=srt_key_in)
+        _raw = obj["Body"].read().decode("utf-8", "ignore")
+        srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
+    else:
+        srt_text = _fastwh_to_srt(video_url)
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
     with open(srt_local, "w", encoding="utf-8") as f:
         f.write(srt_text)
@@ -375,8 +388,17 @@ def handler(event):
     except Exception:
         pass
 
+    # Derive base name from provided output_key or video filename
+    base = None
+    if output_key:
+        base = pathlib.Path(output_key).stem
+    elif srt_key_in:
+        base = pathlib.Path(srt_key_in).stem
+    else:
+        base = pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "caption"
+
     # Upload SRT
-    srt_key = output_key if output_key else _key(job_id, "captions", "captions.srt")
+    srt_key = output_key if output_key else _key(job_id, "captions", f"{base}.srt")
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
@@ -403,7 +425,7 @@ def handler(event):
         base = pathlib.Path(srt_key).stem if output_key else (pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "captioned")
         out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
         _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
-        cap_key = _key(job_id, "reels", f"{base}.mp4")
+        cap_key = inp.get("output_video_key") or _key(job_id, "captions", f"{base}.mp4")
         up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
         result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
     return result
