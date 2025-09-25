@@ -398,7 +398,7 @@ def handler(event):
         base = pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "caption"
 
     # Upload SRT
-    srt_key = output_key if output_key else _key(job_id, "captions", f"{base}.srt")
+    srt_key = output_key if output_key else _key(job_id, "captions", "transcripts", f"{base}.srt")
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
