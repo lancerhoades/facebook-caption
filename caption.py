@@ -2,18 +2,19 @@ import os
 import re
 import argparse
 import subprocess
+import string
 from pathlib import Path
 
 from pydub import AudioSegment
 from openai import OpenAI
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
+from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip, vfx
 
 # --- Configuration ---
 MAX_CHUNK_SIZE = 24 * 1024 * 1024  # 24 MB
-CHUNK_LENGTH_MS = 5 * 60 * 1000    # 5 minutes
-MAX_CHARS_PER_SEGMENT = 32         # 32–40 works well for mobile
+CHUNK_LENGTH_MS = 60 * 1000        # 60 seconds for tighter alignment at chunk edges
+MAX_WORDS_PER_SEGMENT = 3          # hard cap of 3 spoken words on screen
 
 # Initialize OpenAI client
 api_key = os.getenv("OPENAI_API_KEY")
@@ -69,7 +70,8 @@ def _supports_verbose_json(model: str) -> bool:
 
 def _evenly_time_words(text: str, chunk_seconds: float, offset: float):
     """Approximate per-word timings by distributing evenly across the chunk."""
-    tokens = re.findall(r"[A-Za-z0-9']+|-+", text)
+    # Count only real word tokens (ignore standalone punctuation/hyphens)
+    tokens = re.findall(r"[A-Za-z0-9']+", text)
     tokens = [t for t in tokens if t.strip()]
     if not tokens or chunk_seconds <= 0:
         return []
@@ -92,7 +94,7 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
                     file=af,
                     model=model,
                     response_format="verbose_json",
-                    timestamp_granularities=["segment", "word"],
+                    timestamp_granularities=["word"],  # word-level timing for perfect sync
                     **({"language": language} if language else {})
                 )
             else:
@@ -107,10 +109,7 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
         print("[DEBUG] Raw transcription response keys:", list(data.keys()))
 
         if verbose:
-            wl = data.get("words") or [
-                w for seg in (data.get("segments") or [])
-                for w in (seg.get("words") or [])
-            ]
+            wl = data.get("words") or []
             if not wl:
                 print("[WARN] verbose_json contained no word timestamps; approximating.")
                 chunk_len_s = AudioSegment.from_wav(str(path)).duration_seconds
@@ -133,36 +132,68 @@ def transcribe_chunks(chunks, model: str, language: str | None = None):
     print(f"[INFO] Total words collected: {len(words)}")
     return sorted(words, key=lambda x: x["start"])
 
-# ---------- Grouping ----------
+# ---------- Grouping (strict ≤3 words per tile, punctuation-safe) ----------
 
-def group_into_segments(words, max_chars=32):
+_PUNCT = set(string.punctuation)
+
+def _attach_punct(display_words):
+    """
+    Attach punctuation tokens to the previous word for visual rendering
+    (no timing changes).
+    """
+    out = []
+    for w in display_words:
+        txt = w["word"]
+        if txt in _PUNCT and out:
+            out[-1]["word"] = out[-1]["word"] + txt
+        else:
+            out.append(w)
+    return out
+
+def group_into_segments(words, max_words: int = MAX_WORDS_PER_SEGMENT):
+    """
+    Build caption segments of up to `max_words` real words (ignoring punctuation-only tokens).
+    Each segment’s timing is [first_word.start, last_word.end].
+    """
+    # 1) Filter/normalize
+    cleaned = []
+    for w in words:
+        if not all(k in w for k in ("start", "end", "word")):
+            continue
+        txt = str(w["word"]).strip()
+        if not txt:
+            continue
+        cleaned.append({"start": float(w["start"]), "end": float(w["end"]), "word": txt})
+
+    # 2) Attach punctuation visually
+    vis_words = _attach_punct(cleaned)
+
+    # 3) Build segments
     segments = []
     group = []
-    char_count = 0
-    for w in words:
-        word_text = str(w.get("word", "")).strip()
-        if not all(k in w for k in ("start", "end", "word")) or not word_text:
-            print(f"[WARNING] Skipping invalid word entry: {w}")
-            continue
+    real_count = 0
 
-        added_length = len(word_text) + (1 if group else 0)
-        if char_count + added_length > max_chars and group:
-            start = group[0]["start"]
-            end = group[-1]["end"]
-            text = " ".join(gw["word"].strip() for gw in group)
-            segments.append((start, end, text))
-            group = []
-            char_count = 0
-
-        group.append(w)
-        char_count += added_length
-
-    if group:
+    def flush():
+        nonlocal group, real_count
+        if not group:
+            return
         start = group[0]["start"]
         end = group[-1]["end"]
-        text = " ".join(gw["word"].strip() for gw in group)
+        text = " ".join(g["word"] for g in group)
         segments.append((start, end, text))
-    print(f"[INFO] Total segments: {len(segments)}")
+        group = []
+        real_count = 0
+
+    for w in vis_words:
+        is_real = not (len(w["word"]) == 1 and w["word"] in _PUNCT)
+        if is_real and real_count == max_words:
+            flush()
+        group.append(w)
+        if is_real:
+            real_count += 1
+
+    flush()
+    print(f"[INFO] Total segments (≤{max_words} words each): {len(segments)}")
     return segments
 
 # ---------- Caption drawing (Pillow) ----------
@@ -186,68 +217,37 @@ def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
     # Last resort: PIL default bitmap font (no size scaling)
     return ImageFont.load_default()
 
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int):
+def _render_caption_image_singleline(text: str, safe_width: int, base_fontsize: int, padding_px: int = 12):
     """
-    Simple greedy wrap by words to fit max_width. Returns list of lines and max line width.
+    Render ALL-CAPS text on a semi-transparent rounded rectangle background (single line).
+    Auto-shrinks font to fit within safe_width.
     """
-    words = text.split()
-    lines = []
-    cur = []
-    max_w = 0
-    for w in words:
-        trial = (" ".join(cur + [w])).strip()
-        w_box = draw.textbbox((0, 0), trial, font=font, stroke_width=2)
-        w_width = w_box[2] - w_box[0]
-        if cur and w_width > max_width:
-            line = " ".join(cur)
-            lines.append(line)
-            max_w = max(max_w, draw.textbbox((0, 0), line, font=font, stroke_width=2)[2])
-            cur = [w]
-        else:
-            cur.append(w)
-    if cur:
-        line = " ".join(cur)
-        lines.append(line)
-        max_w = max(max_w, draw.textbbox((0, 0), line, font=font, stroke_width=2)[2])
-    return lines, min(max_w, max_width)
-
-def _render_caption_image(text: str, safe_width: int, base_fontsize: int):
-    """
-    Render uppercase text with white fill and black stroke onto a transparent RGBA image.
-    Auto-scales font down if needed to keep within safe_width.
-    """
-    text = text.upper()
+    text = text.upper().strip()
     fontsize = base_fontsize
-    for _ in range(6):  # try a few times to fit width
+    for _ in range(8):
         font = _load_font(fontsize)
-        tmp_img = Image.new("RGBA", (safe_width, base_fontsize * 4), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(tmp_img)
-        lines, max_line_w = _wrap_text(draw, text, font, safe_width)
-        line_height = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
-        spacing = max(4, int(fontsize * 0.25))
-        total_h = len(lines) * line_height + (len(lines) - 1) * spacing
-        if max_line_w <= safe_width:
-            # render final image
-            img = Image.new("RGBA", (safe_width, total_h + spacing * 2), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-            y = spacing
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font, stroke_width=2)
-                w = bbox[2] - bbox[0]
-                x = (safe_width - w) // 2
-                draw.text(
-                    (x, y), line, font=font,
-                    fill=(255, 255, 255, 255),
-                    stroke_width=2, stroke_fill=(0, 0, 0, 255)
-                )
-                y += line_height + spacing
+        tmp = Image.new("RGBA", (1, 1))
+        d = ImageDraw.Draw(tmp)
+        bbox = d.textbbox((0, 0), text, font=font, stroke_width=2)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        if w + 2 * padding_px <= safe_width:
+            img = Image.new("RGBA", (w + 2 * padding_px, h + 2 * padding_px), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            # Rounded rectangle background
+            bg_radius = max(6, int(h * 0.4))
+            d.rounded_rectangle([0, 0, img.width, img.height], radius=bg_radius, fill=(0, 0, 0, 110))
+            # Centered text
+            d.text((padding_px, padding_px), text, font=font,
+                   fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
             return img
-        fontsize = max(10, int(fontsize * 0.9))  # shrink and try again
-    # Fallback: single line without wrap
+        fontsize = max(12, int(fontsize * 0.9))
+    # Fallback (if still too wide)
     font = _load_font(fontsize)
-    img = Image.new("RGBA", (safe_width, fontsize * 2), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.text((0, 0), text, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    img = Image.new("RGBA", (min(w + 2 * padding_px, safe_width), h + 2 * padding_px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, img.width, img.height], radius=max(6, int(h * 0.4)), fill=(0, 0, 0, 110))
+    d.text((padding_px, padding_px), text, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
     return img
 
 # ---------- Video compositor ----------
@@ -259,19 +259,40 @@ def add_captions(video_path: Path, segments, output_path: Path):
     base_fs = max(14, int(video.h / 50))
     padding = base_fs // 2
     safe_width = int(video.w * 0.9)  # 90% of video width
-    pos_y = int(video.h * 2 / 3) + padding
+    pos_y = int(video.h * 0.60) + padding  # a bit higher to avoid UI chrome
+
+    lead = 0.08  # 80 ms early for perceived sync
+    tail = 0.06  # 60 ms linger after last phoneme
+    fade_ms = 90
+    fade_s = fade_ms / 1000.0
 
     for start, end, txt in segments:
-        duration = max(0.05, end - start)
-        fontsize = int(base_fs * 2.5)  # larger for reels
-        pil_img = _render_caption_image(txt, safe_width, fontsize)
+        adj_start = max(0, start - lead)
+        adj_end = end + tail
+        duration = max(0.05, adj_end - adj_start)
+        fontsize = int(base_fs * 2.5)  # larger for reels/shorts
+        pil_img = _render_caption_image_singleline(txt, safe_width, fontsize)
         np_frame = np.array(pil_img)
-        clip = ImageClip(np_frame, transparent=True).set_start(start).set_duration(duration)
-        clip = clip.set_position(("center", pos_y))
+
+        clip = (
+            ImageClip(np_frame, transparent=True)
+            .set_start(adj_start)
+            .set_duration(duration)
+            .set_position(("center", pos_y))
+            .fx(vfx.fadein, fade_s)
+            .fx(vfx.fadeout, fade_s)
+        )
         clips.append(clip)
 
     final = CompositeVideoClip(clips)
-    final.write_videofile(str(output_path), codec="libx264", audio_codec="aac")
+    final.write_videofile(
+        str(output_path),
+        codec="libx264",
+        audio_codec="aac",
+        fps=video.fps,  # pin FPS to avoid micro-drift
+        preset="medium",
+        ffmpeg_params=["-movflags", "+faststart"]
+    )
 
 # ---------- Main ----------
 
@@ -293,10 +314,10 @@ def main():
         help="ISO-639-1 code for the input language (e.g., 'en'). Improves accuracy/latency."
     )
     parser.add_argument(
-        "--max-chars",
+        "--max-words",
         type=int,
-        default=MAX_CHARS_PER_SEGMENT,
-        help="Max characters per on-screen caption segment."
+        default=MAX_WORDS_PER_SEGMENT,
+        help="Max spoken words per on-screen caption segment."
     )
     args = parser.parse_args()
 
@@ -309,7 +330,7 @@ def main():
     extract_audio(video_path, wav_path)
     chunks = split_audio(wav_path)
     words = transcribe_chunks(chunks, model=args.model, language=args.language)
-    cap_segs = group_into_segments(words, max_chars=args.max_chars)
+    cap_segs = group_into_segments(words, max_words=args.max_words)
 
     txt_file = transcripts_dir / f"{video_path.stem}-captions.txt"
     with open(txt_file, "w", encoding="utf-8") as f:
