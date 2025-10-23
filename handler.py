@@ -17,18 +17,22 @@ FASTWH_VAD     = os.getenv("FASTWH_ENABLE_VAD", "true").lower() in ("1","true","
 FASTWH_WORDTS  = os.getenv("FASTWH_WORD_TIMESTAMPS", "true").lower() in ("1","true","yes","on")
 LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None  # optional, e.g. "en"
 
+# Choose backend: "fastwhisper" (default) or "openai" (uses caption.py)
+CAPTION_BACKEND = os.getenv("CAPTION_BACKEND", "fastwhisper").lower()
+
 # Caption styling (ASS force_style)
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
-MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt reflow (awk)
+MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt reflow (awk) and passed to caption.py when backend=openai
 MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))    # optional srt reflow (awk)
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
+print(f"[CFG] CAPTION_BACKEND={CAPTION_BACKEND}")
 
 if not AWS_S3_BUCKET:
     raise RuntimeError("AWS_S3_BUCKET is required")
-if not (RUNPOD_API_KEY and FASTWH_ID):
-    raise RuntimeError("RUNPOD_API_KEY and RUNPOD_FASTWHISPER_ENDPOINT_ID are required")
+if CAPTION_BACKEND == "fastwhisper" and not (RUNPOD_API_KEY and FASTWH_ID):
+    raise RuntimeError("RUNPOD_API_KEY and RUNPOD_FASTWHISPER_ENDPOINT_ID are required for fastwhisper backend")
 
 # --------- S3 client ---------
 s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
@@ -197,6 +201,75 @@ def _parse_srt_blocks(srt_text: str):
             pass
     return blocks
 
+# --------- OpenAI caption.py integration (optional backend) ---------
+def _run_caption_py(video_local: str, output_local: str, language: str | None, max_words: int):
+    """
+    Calls caption.py to generate a captioned MP4 using OpenAI Whisper-1
+    with word-level timestamps and the 3-word tiles logic.
+    """
+    script_path = os.getenv("CAPTION_PY_PATH", "/app/caption.py")
+    cmd = ["python", script_path, video_local, "--output", output_local, "--model", "whisper-1"]
+    if language:
+        cmd += ["--language", language]
+    if max_words and max_words > 0:
+        cmd += ["--max-words", str(max_words)]
+    print("[OPENAI-CAPTION] running:", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"caption.py failed: {e}")
+
+def _maybe_captions_txt_to_srt(video_local: str) -> str | None:
+    """
+    caption.py emits transcripts/<stem>-captions.txt:
+        <start> --> <end>
+        TEXT
+
+    Convert to SRT so we can upload alongside the MP4.
+    """
+    v = pathlib.Path(video_local)
+    txt_path = v.parent / "transcripts" / f"{v.stem}-captions.txt"
+    if not txt_path.exists():
+        return None
+
+    def fmt_hms(t):
+        ms_total = int(round(float(t) * 1000))
+        hh = ms_total // 3_600_000; ms_total %= 3_600_000
+        mm = ms_total // 60_000;    ms_total %= 60_000
+        ss = ms_total // 1000;      ms = ms_total % 1000
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    blocks = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    parts = [p for p in raw.split("\n\n") if p.strip()]
+    for part in parts:
+        lines = [ln.strip() for ln in part.splitlines() if ln.strip()]
+        if len(lines) >= 2 and "-->" in lines[0]:
+            tline = lines[0]
+            a, b = [x.strip() for x in tline.split("-->")]
+            try:
+                start = float(a)
+                end = float(b)
+                text = " ".join(lines[1:])
+                blocks.append((start, end, text))
+            except Exception:
+                continue
+
+    if not blocks:
+        return None
+
+    srt_lines = []
+    for i, (s, e, t) in enumerate(blocks, 1):
+        srt_lines += [str(i), f"{fmt_hms(s)} --> {fmt_hms(e)}", t, ""]
+    srt_text = "\n".join(srt_lines) + "\n"
+
+    fd, srt_path = tempfile.mkstemp(prefix="captions_from_txt_", suffix=".srt")
+    os.close(fd)
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(srt_text)
+    return srt_path
+
 # --------- FastWhisper (FORCE SRT; run + poll) ---------
 def _fastwh_to_srt(video_url: str) -> str:
     """
@@ -315,21 +388,53 @@ def _fastwh_to_srt(video_url: str) -> str:
 # --------- main handler ---------
 def handler(event):
     inp = (event or {}).get("input") or {}
-    job_id    = inp.get("job_id")
-    video_url = inp.get("video_url")
-    style     = inp.get("style")
+    job_id     = inp.get("job_id")
+    video_url  = inp.get("video_url")
+    style      = inp.get("style")
     output_key = inp.get("output_key")   # optional: where to put the SRT
-    burn      = bool(inp.get("burn", True))
+    burn       = bool(inp.get("burn", True))
 
     if not job_id:
         raise RuntimeError("job_id is required")
     if not video_url:
         raise RuntimeError("video_url is required")
 
-    # Download once (for duration trim + burn-in)
+    # Download once (for duration trim + burn-in or caption.py)
     vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
     _download_url_to(vid_local, video_url)
 
+    # --------- Branch: Use caption.py (OpenAI) pipeline ---------
+    if CAPTION_BACKEND == "openai":
+        print("[BACKEND] Using caption.py (OpenAI Whisper-1, 3-word tiles)")
+        # Run caption.py to create captioned MP4
+        out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
+        max_words_for_tiles = MAX_WORDS_PER_CU if MAX_WORDS_PER_CU > 0 else 3
+        _run_caption_py(
+            video_local=vid_local,
+            output_local=out_local,
+            language=LANG_HINT,
+            max_words=max_words_for_tiles
+        )
+
+        # Try to collect captions.txt -> SRT (optional)
+        srt_local = _maybe_captions_txt_to_srt(vid_local)
+        result = {}
+
+        # Upload SRT if available
+        if srt_local:
+            base = pathlib.Path(output_key).stem if output_key else (pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "caption")
+            srt_key = output_key if output_key else _key(job_id, "captions", "transcripts", f"{base}.srt")
+            up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
+            result.update({"srt_key": up_srt["key"], "srt_url": up_srt["url"]})
+
+        # Upload captioned MP4
+        cap_key = inp.get("output_video_key") or _key(job_id, "captions", f"{_slugify(pathlib.Path(urllib.parse.urlparse(video_url).path).stem or 'captioned')}.mp4")
+        up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
+        result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
+        return result
+
+    # --------- Default: FastWhisper SRT + ffmpeg burn ---------
+    print("[BACKEND] Using FastWhisper (RunPod) SRT + ffmpeg burn path")
     # Use provided SRT (if any); else transcribe via RunPod (force SRT)
     srt_text = None
     srt_url_in  = inp.get("srt_url")
@@ -347,6 +452,7 @@ def handler(event):
         srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
     else:
         srt_text = _fastwh_to_srt(video_url)
+
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
     with open(srt_local, "w", encoding="utf-8") as f:
         f.write(srt_text)
