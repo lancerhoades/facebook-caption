@@ -161,6 +161,97 @@ def _segments_to_srt(segments) -> str:
         idx += 1
     return ("\n".join(out) + "\n") if out else ""
 
+def _normalize_word_spacing(text: str) -> str:
+    # Remove spaces before punctuation for cleaner captions.
+    text = re.sub(r"\s+([,.;:!?])", r"\\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+def _words_to_srt(words, max_words: int, max_cue_duration: float) -> str:
+    """
+    Build SRT from word-level timestamps. Respects max_words and max_cue_duration.
+    """
+    def fmt_hms(t):
+        ms_total = int(round(float(t) * 1000))
+        hh = ms_total // 3_600_000; ms_total %= 3_600_000
+        mm = ms_total // 60_000;    ms_total %= 60_000
+        ss = ms_total // 1000;      ms = ms_total % 1000
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    cues = []
+    cur = []
+    for w in words:
+        txt = str(w.get("word", "")).strip()
+        if not txt:
+            continue
+        start = w.get("start")
+        end = w.get("end")
+        if start is None or end is None:
+            continue
+
+        if cur:
+            cur_start = cur[0]["start"]
+            next_len = len(cur) + 1
+            next_end = float(end)
+            next_dur = next_end - cur_start
+            if (max_words > 0 and next_len > max_words) or (max_cue_duration > 0 and next_dur > max_cue_duration):
+                cues.append(cur)
+                cur = []
+
+        cur.append({"start": float(start), "end": float(end), "word": txt})
+
+    if cur:
+        cues.append(cur)
+
+    out = []
+    idx = 1
+    for cue in cues:
+        start = cue[0]["start"]
+        end = cue[-1]["end"]
+        if max_cue_duration > 0 and end - start > max_cue_duration:
+            end = start + max_cue_duration
+        text = _normalize_word_spacing(" ".join(w["word"] for w in cue))
+        if not text:
+            continue
+        out += [str(idx), f"{fmt_hms(start)} --> {fmt_hms(end)}", text, ""]
+        idx += 1
+    return ("\n".join(out) + "\n") if out else ""
+
+def _fastwh_extract_words(data):
+    """
+    Extract word-level timestamps from FastWhisper-style responses.
+    """
+    def pull_words_from_segments(segs):
+        words = []
+        for s in segs or []:
+            for w in s.get("words") or []:
+                if {"start", "end", "word"} <= set(w.keys()):
+                    words.append({"start": w["start"], "end": w["end"], "word": w["word"]})
+        return words
+
+    out = data.get("output")
+    if isinstance(out, dict) and isinstance(out.get("segments"), list):
+        words = pull_words_from_segments(out["segments"])
+        if words:
+            return words
+    if isinstance(out, list) and out:
+        first = out[0]
+        if isinstance(first, dict) and isinstance(first.get("segments"), list):
+            words = pull_words_from_segments(first["segments"])
+            if words:
+                return words
+
+    if isinstance(data.get("segments"), list):
+        words = pull_words_from_segments(data["segments"])
+        if words:
+            return words
+    nest = data.get("data")
+    if isinstance(nest, dict) and isinstance(nest.get("segments"), list):
+        words = pull_words_from_segments(nest["segments"])
+        if words:
+            return words
+
+    return []
+
 def _parse_srt_blocks(srt_text: str):
     """
     Return list of (start_s, end_s, text). Robust to multi-line text blocks.
@@ -271,7 +362,7 @@ def _maybe_captions_txt_to_srt(video_local: str) -> str | None:
     return srt_path
 
 # --------- FastWhisper (FORCE SRT; run + poll) ---------
-def _fastwh_to_srt(video_url: str) -> str:
+def _fastwh_to_srt(video_url: str, *, return_data: bool = False) -> str | tuple[str, dict]:
     """
     Submit to Faster-Whisper with a hard schema:
       input.audio: string (URL)
@@ -292,7 +383,9 @@ def _fastwh_to_srt(video_url: str) -> str:
         "input": {
             "audio": video_url,
             "model": "large-v3",
-            "transcription": "srt"
+            "transcription": "srt",
+            "enable_vad": FASTWH_VAD,
+            "word_timestamps": FASTWH_WORDTS,
         }
     }
 
@@ -338,50 +431,56 @@ def _fastwh_to_srt(video_url: str) -> str:
     if isinstance(out, dict):
         for k in ("srt", "text_srt", "vtt", "transcription", "text"):
             srt = maybe_srt(out.get(k))
-            if srt: return srt
+            if srt:
+                return (srt, data) if return_data else srt
         if isinstance(out.get("segments"), list):
             srt = _segments_to_srt(out["segments"])
             if srt.strip():
                 print("[FASTWH] built SRT from output.segments")
-                return srt
+                return (srt, data) if return_data else srt
 
     if isinstance(out, list) and out:
         first = out[0]
         if isinstance(first, dict):
             for k in ("srt", "text_srt", "vtt", "transcription", "text"):
                 srt = maybe_srt(first.get(k))
-                if srt: return srt
+                if srt:
+                    return (srt, data) if return_data else srt
             if isinstance(first.get("segments"), list):
                 srt = _segments_to_srt(first["segments"])
                 if srt.strip():
                     print("[FASTWH] built SRT from output[0].segments")
-                    return srt
+                    return (srt, data) if return_data else srt
         else:
             srt = maybe_srt(first)
-            if srt: return srt
+            if srt:
+                return (srt, data) if return_data else srt
 
     srt = maybe_srt(out)
-    if srt: return srt
+    if srt:
+        return (srt, data) if return_data else srt
 
     for k in ("srt", "text_srt", "vtt", "transcription", "text"):
         srt = maybe_srt(data.get(k))
-        if srt: return srt
+        if srt:
+            return (srt, data) if return_data else srt
     if isinstance(data.get("segments"), list):
         srt = _segments_to_srt(data["segments"])
         if srt.strip():
             print("[FASTWH] built SRT from top-level segments")
-            return srt
+            return (srt, data) if return_data else srt
 
     nest = data.get("data")
     if isinstance(nest, dict):
-        for k in ("srt", "text_srt", "vtt", "transcription", "text"):
-            srt = maybe_srt(nest.get(k))
-            if srt: return srt
+            for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+                srt = maybe_srt(nest.get(k))
+                if srt:
+                    return (srt, data) if return_data else srt
         if isinstance(nest.get("segments"), list):
             srt = _segments_to_srt(nest["segments"])
             if srt.strip():
                 print("[FASTWH] built SRT from data.segments")
-                return srt
+                return (srt, data) if return_data else srt
 
     raise RuntimeError(f"COMPLETED but no SRT/VTT/segments in response. Snip: {json.dumps(data)[:800]}")
 
@@ -437,6 +536,7 @@ def handler(event):
     print("[BACKEND] Using FastWhisper (RunPod) SRT + ffmpeg burn path")
     # Use provided SRT (if any); else transcribe via RunPod (force SRT)
     srt_text = None
+    srt_from_words = False
     srt_url_in  = inp.get("srt_url")
     srt_text_in = inp.get("srt_text")
     srt_key_in  = inp.get("srt_key")
@@ -451,7 +551,15 @@ def handler(event):
         _raw = obj["Body"].read().decode("utf-8", "ignore")
         srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
     else:
-        srt_text = _fastwh_to_srt(video_url)
+        srt_text, fw_data = _fastwh_to_srt(video_url, return_data=True)
+        words = _fastwh_extract_words(fw_data)
+        if words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0):
+            max_words = MAX_WORDS_PER_CU if MAX_WORDS_PER_CU > 0 else 3
+            word_srt = _words_to_srt(words, max_words, MAX_CUE_DURATION)
+            if word_srt.strip():
+                srt_text = word_srt
+                srt_from_words = True
+                print(f"[FASTWH] built word-based SRT words={len(words)} max_words={max_words} max_dur={MAX_CUE_DURATION}")
 
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
     with open(srt_local, "w", encoding="utf-8") as f:
@@ -510,7 +618,7 @@ def handler(event):
 
     # Optional: chunkify SRT (if AWK tool is present in the image)
     try:
-        if MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0:
+        if not srt_from_words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0):
             tmp_fd, tuned_srt = tempfile.mkstemp(prefix="captions_tuned_", suffix=".srt"); os.close(tmp_fd)
             awk = "/app/tools/srt_chunkify.awk"
             cmd = ["awk", f"-vW={MAX_WORDS_PER_CU}", f"-vD={MAX_CUE_DURATION}", "-f", awk, srt_local]
