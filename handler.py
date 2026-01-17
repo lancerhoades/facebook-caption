@@ -163,7 +163,7 @@ def _segments_to_srt(segments) -> str:
 
 def _normalize_word_spacing(text: str) -> str:
     # Remove spaces before punctuation for cleaner captions.
-    text = re.sub(r"\s+([,.;:!?])", r"\\1", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     return re.sub(r"\s{2,}", " ", text).strip()
 
 def _words_to_srt(words, max_words: int, max_cue_duration: float) -> str:
@@ -472,10 +472,10 @@ def _fastwh_to_srt(video_url: str, *, return_data: bool = False) -> str | tuple[
 
     nest = data.get("data")
     if isinstance(nest, dict):
-            for k in ("srt", "text_srt", "vtt", "transcription", "text"):
-                srt = maybe_srt(nest.get(k))
-                if srt:
-                    return (srt, data) if return_data else srt
+        for k in ("srt", "text_srt", "vtt", "transcription", "text"):
+            srt = maybe_srt(nest.get(k))
+            if srt:
+                return (srt, data) if return_data else srt
         if isinstance(nest.get("segments"), list):
             srt = _segments_to_srt(nest["segments"])
             if srt.strip():
