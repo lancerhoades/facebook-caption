@@ -24,6 +24,8 @@ CAPTION_BACKEND = os.getenv("CAPTION_BACKEND", "fastwhisper").lower()
 FONT_FAMILY      = os.getenv("FONT_FAMILY", "MisterEarl BT")
 MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt reflow (awk) and passed to caption.py when backend=openai
 MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))    # optional srt reflow (awk)
+WORD_GAP_SPLIT_SEC = float(os.getenv("WORD_GAP_SPLIT_SEC", "0.35"))
+MIN_WORDS_PER_CUE  = int(os.getenv("MIN_WORDS_PER_CUE", "1"))
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
@@ -166,7 +168,7 @@ def _normalize_word_spacing(text: str) -> str:
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     return re.sub(r"\s{2,}", " ", text).strip()
 
-def _words_to_srt(words, max_words: int, max_cue_duration: float) -> str:
+def _words_to_srt(words, max_words: int, max_cue_duration: float, gap_split_sec: float, min_words_per_cue: int) -> str:
     """
     Build SRT from word-level timestamps. Respects max_words and max_cue_duration.
     """
@@ -193,7 +195,11 @@ def _words_to_srt(words, max_words: int, max_cue_duration: float) -> str:
             next_len = len(cur) + 1
             next_end = float(end)
             next_dur = next_end - cur_start
-            if (max_words > 0 and next_len > max_words) or (max_cue_duration > 0 and next_dur > max_cue_duration):
+            gap = float(start) - cur[-1]["end"]
+            if (gap_split_sec > 0 and gap > gap_split_sec and len(cur) >= max(1, min_words_per_cue)):
+                cues.append(cur)
+                cur = []
+            elif (max_words > 0 and next_len > max_words) or (max_cue_duration > 0 and next_dur > max_cue_duration):
                 cues.append(cur)
                 cur = []
 
@@ -555,7 +561,7 @@ def handler(event):
         words = _fastwh_extract_words(fw_data)
         if words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0):
             max_words = MAX_WORDS_PER_CU if MAX_WORDS_PER_CU > 0 else 3
-            word_srt = _words_to_srt(words, max_words, MAX_CUE_DURATION)
+            word_srt = _words_to_srt(words, max_words, MAX_CUE_DURATION, WORD_GAP_SPLIT_SEC, MIN_WORDS_PER_CUE)
             if word_srt.strip():
                 srt_text = word_srt
                 srt_from_words = True
