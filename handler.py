@@ -1,5 +1,6 @@
 import traceback
 import os, re, json, tempfile, subprocess, urllib.request, urllib.parse, unicodedata, pathlib
+from PIL import Image, ImageDraw, ImageFont
 from botocore.client import Config
 import boto3, requests
 import runpod
@@ -26,6 +27,13 @@ MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt r
 MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))    # optional srt reflow (awk)
 WORD_GAP_SPLIT_SEC = float(os.getenv("WORD_GAP_SPLIT_SEC", "0.35"))
 MIN_WORDS_PER_CUE  = int(os.getenv("MIN_WORDS_PER_CUE", "1"))
+SAFEZONE_TOP_PCT = float(os.getenv("SAFEZONE_TOP_PCT", "0.14"))
+SAFEZONE_BOTTOM_PCT = float(os.getenv("SAFEZONE_BOTTOM_PCT", "0.35"))
+SAFEZONE_SIDE_PCT = float(os.getenv("SAFEZONE_SIDE_PCT", "0.06"))
+SAFEZONE_PAD_PCT = float(os.getenv("SAFEZONE_PAD_PCT", "0.02"))
+SAFEZONE_DEBUG = os.getenv("SAFEZONE_DEBUG", "false").lower() in ("1","true","yes","on")
+SAFEZONE_ENFORCE = os.getenv("SAFEZONE_ENFORCE", "true").lower() in ("1","true","yes","on")
+FONT_SIZE_PCT = float(os.getenv("FONT_SIZE_PCT", "0.05"))
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
@@ -58,6 +66,79 @@ def _has_ffmpeg() -> bool:
 
 print("[BOOT] ffmpeg present:", _has_ffmpeg())
 
+def _probe_video_size(video_path: str) -> tuple[int, int]:
+    out = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+            video_path,
+        ],
+        text=True
+    ).strip()
+    if "x" not in out:
+        raise RuntimeError(f"ffprobe failed to read size: {out}")
+    w_s, h_s = out.split("x", 1)
+    return int(w_s), int(h_s)
+
+def _safezone_rect(video_w: int, video_h: int):
+    left = int(video_w * SAFEZONE_SIDE_PCT)
+    right = int(video_w * (1.0 - SAFEZONE_SIDE_PCT))
+    top = int(video_h * SAFEZONE_TOP_PCT)
+    bottom = int(video_h * (1.0 - SAFEZONE_BOTTOM_PCT))
+    return left, top, right, bottom
+
+def _safezone_debug_filters(video_w: int, video_h: int) -> str:
+    left, top, right, bottom = _safezone_rect(video_w, video_h)
+    top_h = max(0, top)
+    bottom_h = max(0, video_h - bottom)
+    left_w = max(0, left)
+    right_w = max(0, video_w - right)
+    border = max(2, int(video_h * 0.003))
+    parts = [
+        f"drawbox=x=0:y=0:w=iw:h={top_h}:color=red@0.25:t=fill",
+        f"drawbox=x=0:y={bottom}:w=iw:h={bottom_h}:color=red@0.25:t=fill",
+        f"drawbox=x=0:y={top}:w={left_w}:h={bottom - top}:color=red@0.25:t=fill",
+        f"drawbox=x={right}:y={top}:w={right_w}:h={bottom - top}:color=red@0.25:t=fill",
+        f"drawbox=x={left}:y={top}:w={right - left}:h={bottom - top}:color=green@0.8:t={border}",
+    ]
+    return ",".join(parts)
+
+_FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        "/usr/local/share/fonts/custom/MREARLN.TTF",
+        "/usr/local/share/fonts/MREARLN.TTF",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            key = (p, font_size)
+            if key not in _FONT_CACHE:
+                _FONT_CACHE[key] = ImageFont.truetype(p, font_size)
+            return _FONT_CACHE[key]
+    return ImageFont.load_default()
+
+def _check_srt_safezone(srt_text: str, video_w: int, video_h: int, font_size: int):
+    safe_left, safe_top, safe_right, safe_bottom = _safezone_rect(video_w, video_h)
+    safe_pad = int(video_h * SAFEZONE_PAD_PCT)
+    font = _load_font(font_size)
+    img = Image.new("RGBA", (1, 1))
+    draw = ImageDraw.Draw(img)
+    for _, _, text in _parse_srt_blocks(srt_text):
+        if not text:
+            continue
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center", spacing=2, stroke_width=2)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        if text_h > (safe_bottom - safe_top):
+            raise RuntimeError("Caption height exceeds safe-zone height; reduce font size.")
+        x = int((video_w - text_w) / 2)
+        bottom = safe_bottom - safe_pad
+        y = int(bottom - text_h)
+        if x < safe_left or (x + text_w) > safe_right or y < safe_top or (y + text_h) > safe_bottom:
+            raise RuntimeError("Caption bbox intersects safe-zone no-go areas.")
+
 def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
         while True:
@@ -89,11 +170,31 @@ def _write_single_block_srt(path: str, duration_s: float, text: str):
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None,
                           start_s: float | None = None, end_s: float | None = None):
     fonts_dir = "/usr/local/share/fonts/custom"
-    base_style = f"FontName={FONT_FAMILY},Fontsize=30,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2"
-    eff_style = (style.strip() if style else base_style)
+    video_w, video_h = _probe_video_size(video_path)
+    font_size = max(18, int(video_h * FONT_SIZE_PCT))
+    margin_lr = int(video_w * SAFEZONE_SIDE_PCT)
+    margin_v = int(video_h * SAFEZONE_BOTTOM_PCT) + int(video_h * SAFEZONE_PAD_PCT)
+    enforced_style = (
+        f"Alignment=2,MarginL={margin_lr},MarginR={margin_lr},MarginV={margin_v},Fontsize={font_size}"
+    )
+    base_style = (
+        f"FontName={FONT_FAMILY},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        f"BorderStyle=1,Outline=3,Shadow=0,{enforced_style}"
+    )
+    eff_style = (f"{style.strip()},{enforced_style}" if style else base_style)
     fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
     srt_esc = _escape_for_subtitles(srt_path)
     flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={fs_esc}"
+    if SAFEZONE_DEBUG:
+        flt = f"{flt},{_safezone_debug_filters(video_w, video_h)}"
+
+    if SAFEZONE_ENFORCE:
+        try:
+            with open(srt_path, "r", encoding="utf-8") as f:
+                srt_text = f.read()
+            _check_srt_safezone(srt_text, video_w, video_h, font_size)
+        except Exception as e:
+            raise RuntimeError(f"Safe-zone check failed: {e}")
 
     cmd = ["ffmpeg","-hide_banner","-loglevel","error","-stats","-threads","1","-y"]
     # Trim window (fast seek before input)

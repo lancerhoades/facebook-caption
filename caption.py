@@ -16,6 +16,14 @@ MAX_CHUNK_SIZE = 24 * 1024 * 1024  # 24 MB
 CHUNK_LENGTH_MS = 60 * 1000        # 60 seconds for tighter alignment at chunk edges
 MAX_WORDS_PER_SEGMENT = 3          # hard cap of 3 spoken words on screen
 
+# Safe-zone configuration (percentages of width/height)
+SAFEZONE_TOP_PCT = float(os.getenv("SAFEZONE_TOP_PCT", "0.14"))
+SAFEZONE_BOTTOM_PCT = float(os.getenv("SAFEZONE_BOTTOM_PCT", "0.35"))
+SAFEZONE_SIDE_PCT = float(os.getenv("SAFEZONE_SIDE_PCT", "0.06"))
+SAFEZONE_PAD_PCT = float(os.getenv("SAFEZONE_PAD_PCT", "0.02"))
+SAFEZONE_DEBUG = os.getenv("SAFEZONE_DEBUG", "false").lower() in ("1", "true", "yes", "on")
+SAFEZONE_ENFORCE = os.getenv("SAFEZONE_ENFORCE", "true").lower() in ("1", "true", "yes", "on")
+
 # Initialize OpenAI client
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -217,6 +225,31 @@ def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
     # Last resort: PIL default bitmap font (no size scaling)
     return ImageFont.load_default()
 
+def _safezone_rect(video_w: int, video_h: int):
+    left = int(video_w * SAFEZONE_SIDE_PCT)
+    right = int(video_w * (1.0 - SAFEZONE_SIDE_PCT))
+    top = int(video_h * SAFEZONE_TOP_PCT)
+    bottom = int(video_h * (1.0 - SAFEZONE_BOTTOM_PCT))
+    return left, top, right, bottom
+
+def _safezone_debug_overlay(video_w: int, video_h: int) -> Image.Image:
+    left, top, right, bottom = _safezone_rect(video_w, video_h)
+    img = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    # No-go regions
+    d.rectangle([0, 0, video_w, top], fill=(255, 0, 0, 64))
+    d.rectangle([0, bottom, video_w, video_h], fill=(255, 0, 0, 64))
+    d.rectangle([0, top, left, bottom], fill=(255, 0, 0, 64))
+    d.rectangle([right, top, video_w, bottom], fill=(255, 0, 0, 64))
+    # Safe-zone outline
+    border = max(2, int(video_h * 0.003))
+    d.rectangle([left, top, right, bottom], outline=(0, 255, 0, 180), width=border)
+    return img
+
+def _bbox_within_safezone(x: int, y: int, w: int, h: int, safe_rect) -> bool:
+    left, top, right, bottom = safe_rect
+    return x >= left and y >= top and (x + w) <= right and (y + h) <= bottom
+
 def _render_caption_image_singleline(text: str, safe_width: int, base_fontsize: int, padding_px: int = 12):
     """
     Render ALL-CAPS text on a semi-transparent rounded rectangle background (single line).
@@ -258,13 +291,20 @@ def add_captions(video_path: Path, segments, output_path: Path):
 
     base_fs = max(14, int(video.h / 50))
     padding = base_fs // 2
-    safe_width = int(video.w * 0.9)  # 90% of video width
-    pos_y = int(video.h * 0.60) + padding  # a bit higher to avoid UI chrome
+    safe_left, safe_top, safe_right, safe_bottom = _safezone_rect(video.w, video.h)
+    safe_width = safe_right - safe_left
+    safe_pad = int(video.h * SAFEZONE_PAD_PCT)
 
     lead = 0.08  # 80 ms early for perceived sync
     tail = 0.06  # 60 ms linger after last phoneme
     fade_ms = 90
     fade_s = fade_ms / 1000.0
+
+    if SAFEZONE_DEBUG:
+        overlay = _safezone_debug_overlay(video.w, video.h)
+        clips.append(
+            ImageClip(np.array(overlay), transparent=True).set_duration(video.duration)
+        )
 
     for start, end, txt in segments:
         adj_start = max(0, start - lead)
@@ -273,12 +313,24 @@ def add_captions(video_path: Path, segments, output_path: Path):
         fontsize = int(base_fs * 2.5)  # larger for reels/shorts
         pil_img = _render_caption_image_singleline(txt, safe_width, fontsize)
         np_frame = np.array(pil_img)
+        target_bottom = safe_bottom - safe_pad
+        pos_y = max(safe_top, min(int(target_bottom - pil_img.height), safe_bottom - pil_img.height))
+        pos_x = int((video.w - pil_img.width) / 2)
+
+        if SAFEZONE_ENFORCE:
+            if pil_img.height > (safe_bottom - safe_top):
+                raise RuntimeError("Caption height exceeds safe-zone height; reduce font size.")
+            if not _bbox_within_safezone(
+                pos_x, pos_y, pil_img.width, pil_img.height,
+                (safe_left, safe_top, safe_right, safe_bottom)
+            ):
+                raise RuntimeError("Caption bbox intersects safe-zone no-go areas.")
 
         clip = (
             ImageClip(np_frame, transparent=True)
             .set_start(adj_start)
             .set_duration(duration)
-            .set_position(("center", pos_y))
+            .set_position((pos_x, pos_y))
             .fx(vfx.fadein, fade_s)
             .fx(vfx.fadeout, fade_s)
         )
