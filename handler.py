@@ -27,6 +27,7 @@ MAX_WORDS_PER_CU = int(os.getenv("MAX_WORDS_PER_CUE", "0"))     # optional srt r
 MAX_CUE_DURATION = float(os.getenv("MAX_CUE_DURATION", "0"))    # optional srt reflow (awk)
 WORD_GAP_SPLIT_SEC = float(os.getenv("WORD_GAP_SPLIT_SEC", "0.35"))
 MIN_WORDS_PER_CUE  = int(os.getenv("MIN_WORDS_PER_CUE", "1"))
+WORD_GAP_HIDE_SEC = float(os.getenv("WORD_GAP_HIDE_SEC", "0.20"))
 SAFEZONE_TOP_PCT = float(os.getenv("SAFEZONE_TOP_PCT", "0.14"))
 SAFEZONE_BOTTOM_PCT = float(os.getenv("SAFEZONE_BOTTOM_PCT", "0.35"))
 SAFEZONE_SIDE_PCT = float(os.getenv("SAFEZONE_SIDE_PCT", "0.06"))
@@ -556,9 +557,16 @@ def _cues_to_ass_karaoke(cues, video_w: int, video_h: int, font_size: int, margi
         start = cue[0]["start"]
         end = cue[-1]["end"]
         parts = []
+        prev_end = None
         for w in cue:
+            if prev_end is not None:
+                gap = float(w["start"]) - float(prev_end)
+                if gap >= WORD_GAP_HIDE_SEC:
+                    gap_cs = max(1, int(round(gap * 100)))
+                    parts.append(f"{{\\k{gap_cs}}}{{\\alpha&HFF&}}\\h{{\\alpha&H00&}}")
             dur_cs = max(1, int(round((w["end"] - w["start"]) * 100)))
             parts.append(f"{{\\k{dur_cs}}}{w['word']}")
+            prev_end = w["end"]
         text = " ".join(parts)
         lines.append(f"Dialogue: 0,{fmt_ass_time(start)},{fmt_ass_time(end)},Default,,0,0,0,,{text}")
 
