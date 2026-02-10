@@ -39,6 +39,10 @@ WORD_HIGHLIGHT = os.getenv("WORD_HIGHLIGHT", "false").lower() in ("1","true","ye
 WORD_HIGHLIGHT_COLOR = os.getenv("WORD_HIGHLIGHT_COLOR", "#FFD400")
 WORD_INACTIVE_COLOR = os.getenv("WORD_INACTIVE_COLOR", "#FFFFFF")
 WORD_HIGHLIGHT_APPROX = os.getenv("WORD_HIGHLIGHT_APPROX", "true").lower() in ("1","true","yes","on")
+CAPITALIZE_TERMS = os.getenv(
+    "CAPITALIZE_TERMS",
+    "God,Jesus,Christ,Lord,Holy Spirit,Holy Ghost,Bible,Scripture,Church,Gospel"
+)
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
@@ -155,6 +159,65 @@ def _hex_to_ass_color(value: str) -> str:
     except ValueError:
         return "&H00FFFFFF"
     return f"&H00{b:02X}{g:02X}{r:02X}"
+
+def _split_token(token: str):
+    m = re.match(r"^([^A-Za-z0-9]*)([A-Za-z0-9']+)([^A-Za-z0-9]*)$", token)
+    if not m:
+        return "", token, ""
+    return m.group(1), m.group(2), m.group(3)
+
+def _core_key(token: str) -> str:
+    _, core, _ = _split_token(token)
+    if core.lower().endswith("'s"):
+        core = core[:-2]
+    return core.lower()
+
+def _replace_core(token: str, replacement: str) -> str:
+    pre, core, post = _split_token(token)
+    if core.lower().endswith("'s"):
+        return f"{pre}{replacement}'s{post}"
+    return f"{pre}{replacement}{post}"
+
+def _parse_cap_terms() -> tuple[dict, list]:
+    terms = [t.strip() for t in (CAPITALIZE_TERMS or "").split(",") if t.strip()]
+    word_map = {}
+    phrases = []
+    for term in terms:
+        parts = term.split()
+        if len(parts) == 1:
+            word_map[parts[0].lower()] = parts[0]
+        else:
+            phrases.append({"keys": [p.lower() for p in parts], "display": parts})
+    return word_map, phrases
+
+def _apply_capitalization_to_words(words):
+    if not words:
+        return
+    word_map, phrases = _parse_cap_terms()
+    i = 0
+    while i < len(words):
+        matched = False
+        for ph in phrases:
+            n = len(ph["keys"])
+            if i + n > len(words):
+                continue
+            ok = True
+            for j in range(n):
+                if _core_key(words[i + j]["word"]) != ph["keys"][j]:
+                    ok = False
+                    break
+            if ok:
+                for j in range(n):
+                    words[i + j]["word"] = _replace_core(words[i + j]["word"], ph["display"][j])
+                i += n
+                matched = True
+                break
+        if matched:
+            continue
+        key = _core_key(words[i]["word"])
+        if key in word_map:
+            words[i]["word"] = _replace_core(words[i]["word"], word_map[key])
+        i += 1
 
 def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
@@ -769,8 +832,10 @@ def handler(event):
     else:
         srt_text, fw_data = _fastwh_to_srt(video_url, return_data=True)
         words = _fastwh_extract_words(fw_data)
+        _apply_capitalization_to_words(words)
         if WORD_HIGHLIGHT and (not words) and WORD_HIGHLIGHT_APPROX and srt_text:
             words = _approx_words_from_srt_blocks(srt_text)
+            _apply_capitalization_to_words(words)
             if words:
                 print(f"[FASTWH] approximated word timings from SRT words={len(words)}")
         if words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0 or WORD_HIGHLIGHT):
@@ -879,6 +944,9 @@ def handler(event):
             if SAFEZONE_ENFORCE:
                 video_w, video_h = _probe_video_size(vid_local)
                 font_size = max(18, int(video_h * FONT_SIZE_PCT))
+                if not srt_text:
+                    with open(srt_local, "r", encoding="utf-8") as f:
+                        srt_text = f.read()
                 _check_srt_safezone(srt_text, video_w, video_h, font_size)
             _burn_captions_ffmpeg(vid_local, ass_local, out_local, style, sub_is_ass=True)
         else:
