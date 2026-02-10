@@ -34,6 +34,11 @@ SAFEZONE_PAD_PCT = float(os.getenv("SAFEZONE_PAD_PCT", "0.02"))
 SAFEZONE_DEBUG = os.getenv("SAFEZONE_DEBUG", "false").lower() in ("1","true","yes","on")
 SAFEZONE_ENFORCE = os.getenv("SAFEZONE_ENFORCE", "true").lower() in ("1","true","yes","on")
 FONT_SIZE_PCT = float(os.getenv("FONT_SIZE_PCT", "0.05"))
+CAPTION_FORCE_FASTWH = os.getenv("CAPTION_FORCE_FASTWHISPER", "false").lower() in ("1","true","yes","on")
+WORD_HIGHLIGHT = os.getenv("WORD_HIGHLIGHT", "false").lower() in ("1","true","yes","on")
+WORD_HIGHLIGHT_COLOR = os.getenv("WORD_HIGHLIGHT_COLOR", "#FFD400")
+WORD_INACTIVE_COLOR = os.getenv("WORD_INACTIVE_COLOR", "#FFFFFF")
+WORD_HIGHLIGHT_APPROX = os.getenv("WORD_HIGHLIGHT_APPROX", "true").lower() in ("1","true","yes","on")
 
 print(f"[CFG] S3_BUCKET={AWS_S3_BUCKET!r} region={AWS_REGION!r}")
 print(f"[CFG] FASTWH id={FASTWH_ID} vad={FASTWH_VAD} word_ts={FASTWH_WORDTS} lang={LANG_HINT}")
@@ -139,6 +144,18 @@ def _check_srt_safezone(srt_text: str, video_w: int, video_h: int, font_size: in
         if x < safe_left or (x + text_w) > safe_right or y < safe_top or (y + text_h) > safe_bottom:
             raise RuntimeError("Caption bbox intersects safe-zone no-go areas.")
 
+def _hex_to_ass_color(value: str) -> str:
+    v = value.strip().lstrip("#")
+    if len(v) != 6:
+        return "&H00FFFFFF"
+    try:
+        r = int(v[0:2], 16)
+        g = int(v[2:4], 16)
+        b = int(v[4:6], 16)
+    except ValueError:
+        return "&H00FFFFFF"
+    return f"&H00{b:02X}{g:02X}{r:02X}"
+
 def _download_url_to(path: str, url: str):
     with urllib.request.urlopen(url) as r, open(path, "wb") as f:
         while True:
@@ -168,7 +185,8 @@ def _write_single_block_srt(path: str, duration_s: float, text: str):
         f.write(text.strip() + "\n\n")
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None,
-                          start_s: float | None = None, end_s: float | None = None):
+                          start_s: float | None = None, end_s: float | None = None,
+                          sub_is_ass: bool = False):
     fonts_dir = "/usr/local/share/fonts/custom"
     video_w, video_h = _probe_video_size(video_path)
     font_size = max(18, int(video_h * FONT_SIZE_PCT))
@@ -181,14 +199,19 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         f"FontName={FONT_FAMILY},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
         f"BorderStyle=1,Outline=3,Shadow=0,{enforced_style}"
     )
-    eff_style = (f"{style.strip()},{enforced_style}" if style else base_style)
-    fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;")
+    eff_style = None
+    if not sub_is_ass:
+        eff_style = (f"{style.strip()},{enforced_style}" if style else base_style)
+    fs_esc = eff_style.replace(",", "\\,").replace(";", "\\;") if eff_style else None
     srt_esc = _escape_for_subtitles(srt_path)
-    flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={fs_esc}"
+    if fs_esc:
+        flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}:force_style={fs_esc}"
+    else:
+        flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}"
     if SAFEZONE_DEBUG:
         flt = f"{flt},{_safezone_debug_filters(video_w, video_h)}"
 
-    if SAFEZONE_ENFORCE:
+    if SAFEZONE_ENFORCE and (not sub_is_ass):
         try:
             with open(srt_path, "r", encoding="utf-8") as f:
                 srt_text = f.read()
@@ -280,34 +303,7 @@ def _words_to_srt(words, max_words: int, max_cue_duration: float, gap_split_sec:
         ss = ms_total // 1000;      ms = ms_total % 1000
         return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
-    cues = []
-    cur = []
-    for w in words:
-        txt = str(w.get("word", "")).strip()
-        if not txt:
-            continue
-        start = w.get("start")
-        end = w.get("end")
-        if start is None or end is None:
-            continue
-
-        if cur:
-            cur_start = cur[0]["start"]
-            next_len = len(cur) + 1
-            next_end = float(end)
-            next_dur = next_end - cur_start
-            gap = float(start) - cur[-1]["end"]
-            if (gap_split_sec > 0 and gap > gap_split_sec and len(cur) >= max(1, min_words_per_cue)):
-                cues.append(cur)
-                cur = []
-            elif (max_words > 0 and next_len > max_words) or (max_cue_duration > 0 and next_dur > max_cue_duration):
-                cues.append(cur)
-                cur = []
-
-        cur.append({"start": float(start), "end": float(end), "word": txt})
-
-    if cur:
-        cues.append(cur)
+    cues = _words_to_cues(words, max_words, max_cue_duration, gap_split_sec, min_words_per_cue)
 
     out = []
     idx = 1
@@ -398,6 +394,112 @@ def _parse_srt_blocks(srt_text: str):
         except Exception:
             pass
     return blocks
+
+def _approx_words_from_srt_blocks(srt_text: str):
+    words = []
+    for start_s, end_s, text in _parse_srt_blocks(srt_text):
+        text = (text or "").strip()
+        if not text or end_s <= start_s:
+            continue
+        toks = re.findall(r"[A-Za-z0-9']+", text)
+        if not toks:
+            continue
+        per = (end_s - start_s) / len(toks)
+        for i, tok in enumerate(toks):
+            w_start = start_s + i * per
+            w_end = start_s + (i + 1) * per
+            words.append({"start": w_start, "end": w_end, "word": tok})
+    return words
+
+def _words_to_cues(words, max_words: int, max_cue_duration: float, gap_split_sec: float, min_words_per_cue: int):
+    cues = []
+    cur = []
+    for w in words:
+        txt = str(w.get("word", "")).strip()
+        if not txt:
+            continue
+        start = w.get("start")
+        end = w.get("end")
+        if start is None or end is None:
+            continue
+
+        if cur:
+            cur_start = cur[0]["start"]
+            next_len = len(cur) + 1
+            next_end = float(end)
+            next_dur = next_end - cur_start
+            gap = float(start) - cur[-1]["end"]
+            if (gap_split_sec > 0 and gap > gap_split_sec and len(cur) >= max(1, min_words_per_cue)):
+                cues.append(cur)
+                cur = []
+            elif (max_words > 0 and next_len > max_words) or (max_cue_duration > 0 and next_dur > max_cue_duration):
+                cues.append(cur)
+                cur = []
+
+        cur.append({"start": float(start), "end": float(end), "word": txt})
+
+    if cur:
+        cues.append(cur)
+    return cues
+
+def _cues_to_srt(cues) -> str:
+    def fmt_hms(t):
+        ms_total = int(round(float(t) * 1000))
+        hh = ms_total // 3_600_000; ms_total %= 3_600_000
+        mm = ms_total // 60_000;    ms_total %= 60_000
+        ss = ms_total // 1000;      ms = ms_total % 1000
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    out = []
+    idx = 1
+    for cue in cues:
+        start = cue[0]["start"]
+        end = cue[-1]["end"]
+        text = _normalize_word_spacing(" ".join(w["word"] for w in cue))
+        if not text:
+            continue
+        out += [str(idx), f"{fmt_hms(start)} --> {fmt_hms(end)}", text, ""]
+        idx += 1
+    return ("\n".join(out) + "\n") if out else ""
+
+def _cues_to_ass_karaoke(cues, video_w: int, video_h: int, font_size: int, margin_lr: int, margin_v: int,
+                         active_color: str, inactive_color: str) -> str:
+    def fmt_ass_time(t):
+        cs = int(round(float(t) * 100))
+        h = cs // 360000; cs %= 360000
+        m = cs // 6000; cs %= 6000
+        s = cs // 100;   cs %= 100
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    pri = _hex_to_ass_color(active_color)
+    sec = _hex_to_ass_color(inactive_color)
+
+    header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {video_w}",
+        f"PlayResY: {video_h}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{FONT_FAMILY},{font_size},{pri},{sec},&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,3,0,2,{margin_lr},{margin_lr},{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    lines = []
+    for cue in cues:
+        start = cue[0]["start"]
+        end = cue[-1]["end"]
+        parts = []
+        for w in cue:
+            dur_cs = max(1, int(round((w["end"] - w["start"]) * 100)))
+            parts.append(f"{{\\k{dur_cs}}}{w['word']}")
+        text = " ".join(parts)
+        lines.append(f"Dialogue: 0,{fmt_ass_time(start)},{fmt_ass_time(end)},Default,,0,0,0,,{text}")
+
+    return "\n".join(header + lines) + "\n"
 
 # --------- OpenAI caption.py integration (optional backend) ---------
 def _run_caption_py(video_local: str, output_local: str, language: str | None, max_words: int):
@@ -641,12 +743,19 @@ def handler(event):
 
     # --------- Default: FastWhisper SRT + ffmpeg burn ---------
     print("[BACKEND] Using FastWhisper (RunPod) SRT + ffmpeg burn path")
-    # Use provided SRT (if any); else transcribe via RunPod (force SRT)
+    # Use provided SRT (if any) unless forced to re-transcribe; else transcribe via RunPod (force SRT)
+    ass_local = None
     srt_text = None
     srt_from_words = False
     srt_url_in  = inp.get("srt_url")
     srt_text_in = inp.get("srt_text")
     srt_key_in  = inp.get("srt_key")
+    force_fastwh = CAPTION_FORCE_FASTWH or WORD_HIGHLIGHT
+    if force_fastwh and (srt_text_in or srt_url_in or srt_key_in):
+        print("[CAPTION] Ignoring provided SRT due to force_fastwh/word_highlight.")
+        srt_text_in = None
+        srt_url_in = None
+        srt_key_in = None
     if srt_text_in:
         srt_text = srt_text_in
     elif srt_url_in:
@@ -660,13 +769,34 @@ def handler(event):
     else:
         srt_text, fw_data = _fastwh_to_srt(video_url, return_data=True)
         words = _fastwh_extract_words(fw_data)
-        if words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0):
+        if WORD_HIGHLIGHT and (not words) and WORD_HIGHLIGHT_APPROX and srt_text:
+            words = _approx_words_from_srt_blocks(srt_text)
+            if words:
+                print(f"[FASTWH] approximated word timings from SRT words={len(words)}")
+        if words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0 or WORD_HIGHLIGHT):
             max_words = MAX_WORDS_PER_CU if MAX_WORDS_PER_CU > 0 else 3
-            word_srt = _words_to_srt(words, max_words, MAX_CUE_DURATION, WORD_GAP_SPLIT_SEC, MIN_WORDS_PER_CUE)
+            cues = _words_to_cues(words, max_words, MAX_CUE_DURATION, WORD_GAP_SPLIT_SEC, MIN_WORDS_PER_CUE)
+            word_srt = _cues_to_srt(cues)
             if word_srt.strip():
                 srt_text = word_srt
                 srt_from_words = True
                 print(f"[FASTWH] built word-based SRT words={len(words)} max_words={max_words} max_dur={MAX_CUE_DURATION}")
+            if WORD_HIGHLIGHT and cues:
+                try:
+                    video_w, video_h = _probe_video_size(vid_local)
+                    font_size = max(18, int(video_h * FONT_SIZE_PCT))
+                    margin_lr = int(video_w * SAFEZONE_SIDE_PCT)
+                    margin_v = int(video_h * SAFEZONE_BOTTOM_PCT) + int(video_h * SAFEZONE_PAD_PCT)
+                    ass_text = _cues_to_ass_karaoke(
+                        cues, video_w, video_h, font_size, margin_lr, margin_v,
+                        WORD_HIGHLIGHT_COLOR, WORD_INACTIVE_COLOR
+                    )
+                    ass_fd, ass_local = tempfile.mkstemp(prefix="captions_", suffix=".ass"); os.close(ass_fd)
+                    with open(ass_local, "w", encoding="utf-8") as f:
+                        f.write(ass_text)
+                    print("[FASTWH] built ASS karaoke captions")
+                except Exception as e:
+                    print("[FASTWH] failed to build ASS karaoke, falling back:", e)
 
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
     with open(srt_local, "w", encoding="utf-8") as f:
@@ -745,7 +875,14 @@ def handler(event):
             raise RuntimeError("ffmpeg not present in image; cannot burn captions.")
         base = pathlib.Path(srt_key).stem if output_key else (pathlib.Path(urllib.parse.urlparse(video_url).path).stem or "captioned")
         out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
-        _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
+        if ass_local:
+            if SAFEZONE_ENFORCE:
+                video_w, video_h = _probe_video_size(vid_local)
+                font_size = max(18, int(video_h * FONT_SIZE_PCT))
+                _check_srt_safezone(srt_text, video_w, video_h, font_size)
+            _burn_captions_ffmpeg(vid_local, ass_local, out_local, style, sub_is_ass=True)
+        else:
+            _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
         cap_key = inp.get("output_video_key") or _key(job_id, "captions", f"{base}.mp4")
         up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
         result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
