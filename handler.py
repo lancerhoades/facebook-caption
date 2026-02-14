@@ -17,6 +17,8 @@ FASTWH_ID      = os.getenv("RUNPOD_FASTWHISPER_ENDPOINT_ID")
 FASTWH_VAD     = os.getenv("FASTWH_ENABLE_VAD", "true").lower() in ("1","true","yes","on")
 FASTWH_WORDTS  = os.getenv("FASTWH_WORD_TIMESTAMPS", "true").lower() in ("1","true","yes","on")
 LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None  # optional, e.g. "en"
+SLACK_WEBHOOK_ENV = os.getenv("SLACK_WEBHOOK", "").strip()
+SLACK_VERBOSE = os.getenv("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
 
 # Choose backend: "fastwhisper" (default) or "openai" (uses caption.py)
 CAPTION_BACKEND = os.getenv("CAPTION_BACKEND", "fastwhisper").lower()
@@ -75,6 +77,16 @@ def _has_ffmpeg() -> bool:
     return which("ffmpeg") is not None and which("ffprobe") is not None
 
 print("[BOOT] ffmpeg present:", _has_ffmpeg())
+
+def _slack_post(message: str, *, force: bool = False):
+    if not SLACK_WEBHOOK_ENV:
+        return
+    if not (force or SLACK_VERBOSE):
+        return
+    try:
+        requests.post(SLACK_WEBHOOK_ENV, json={"text": message}, timeout=5)
+    except Exception:
+        pass
 
 def _probe_video_size(video_path: str) -> tuple[int, int]:
     out = subprocess.check_output(
@@ -778,6 +790,14 @@ def handler(event):
     if not video_url:
         raise RuntimeError("video_url is required")
 
+    _slack_post(
+        f"[facebook-caption] job={job_id} backend={CAPTION_BACKEND} "
+        f"highlight={'on' if WORD_HIGHLIGHT else 'off'} "
+        f"force_fastwh={'on' if CAPTION_FORCE_FASTWH else 'off'} "
+        f"safezone={'enforce' if SAFEZONE_ENFORCE else 'off'}",
+        force=True
+    )
+
     # Download once (for duration trim + burn-in or caption.py)
     vid_fd, vid_local = tempfile.mkstemp(prefix="video_", suffix=".mp4"); os.close(vid_fd)
     _download_url_to(vid_local, video_url)
@@ -968,6 +988,12 @@ def _safe_handler(event):
     try:
         return handler(event)
     except Exception as e:
+        job_id = None
+        try:
+            job_id = ((event or {}).get("input") or {}).get("job_id")
+        except Exception:
+            job_id = None
+        _slack_post(f"[facebook-caption] job={job_id or 'unknown'} ERROR: {e}", force=True)
         print("[FATAL]", e)
         traceback.print_exc()
         return {"error": str(e)}
