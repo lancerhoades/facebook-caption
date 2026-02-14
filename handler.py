@@ -93,6 +93,15 @@ def _slack_post(message: str, *, force: bool = False):
     except Exception:
         pass
 
+def _scrub_url(url: str) -> str:
+    try:
+        u = urllib.parse.urlparse(url)
+        if not u.scheme or not u.netloc:
+            return url
+        return f"{u.scheme}://{u.netloc}{u.path}"
+    except Exception:
+        return url
+
 def _probe_video_size(video_path: str) -> tuple[int, int]:
     out = subprocess.check_output(
         [
@@ -161,7 +170,7 @@ def _version_overlay_filter(video_w: int, video_h: int) -> str:
     pad = max(10, int(video_h * 0.02))
     return (
         "drawtext="
-        f"fontfile={fontfile}:text='{text}':x={pad}:y=h-th-{pad}:"
+        f"fontfile={fontfile}:text='{text}':x={pad}:y={pad}:"
         f"fontsize={fontsize}:fontcolor=white@0.85:box=1:boxcolor=black@0.5:boxborderw=4"
     )
 
@@ -810,17 +819,31 @@ def handler(event):
     style      = inp.get("style")
     output_key = inp.get("output_key")   # optional: where to put the SRT
     burn       = bool(inp.get("burn", True))
+    srt_url_in  = inp.get("srt_url")
+    srt_text_in = inp.get("srt_text")
+    srt_key_in  = inp.get("srt_key")
 
     if not job_id:
         raise RuntimeError("job_id is required")
     if not video_url:
         raise RuntimeError("video_url is required")
 
+    raw_source = "none"
+    if srt_text_in:
+        raw_source = "srt_text"
+    elif srt_url_in:
+        raw_source = "srt_url"
+    elif srt_key_in:
+        raw_source = "srt_key"
     _slack_post(
-        f"[facebook-caption] job={job_id} backend={CAPTION_BACKEND} "
+        "[facebook-caption] "
+        f"job={job_id} backend={CAPTION_BACKEND} "
         f"highlight={'on' if WORD_HIGHLIGHT else 'off'} "
         f"force_fastwh={'on' if CAPTION_FORCE_FASTWH else 'off'} "
-        f"safezone={'enforce' if SAFEZONE_ENFORCE else 'off'}",
+        f"safezone={'enforce' if SAFEZONE_ENFORCE else 'off'} "
+        f"burn={'on' if burn else 'off'} "
+        f"srt_source={raw_source} "
+        f"video={_scrub_url(str(video_url))}",
         force=True
     )
 
@@ -864,9 +887,6 @@ def handler(event):
     ass_local = None
     srt_text = None
     srt_from_words = False
-    srt_url_in  = inp.get("srt_url")
-    srt_text_in = inp.get("srt_text")
-    srt_key_in  = inp.get("srt_key")
     force_fastwh = CAPTION_FORCE_FASTWH or WORD_HIGHLIGHT
     if force_fastwh and (srt_text_in or srt_url_in or srt_key_in):
         print("[CAPTION] Ignoring provided SRT due to force_fastwh/word_highlight.")

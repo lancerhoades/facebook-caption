@@ -337,7 +337,7 @@ def add_captions(video_path: Path, segments, output_path: Path):
         clips.append(
             ImageClip(np.array(overlay), transparent=True)
             .set_duration(video.duration)
-            .set_position((pad, video.h - overlay.height - pad))
+            .set_position((pad, pad))
         )
 
     for start, end, txt in segments:
