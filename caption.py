@@ -16,6 +16,11 @@ MAX_CHUNK_SIZE = 24 * 1024 * 1024  # 24 MB
 CHUNK_LENGTH_MS = 60 * 1000        # 60 seconds for tighter alignment at chunk edges
 MAX_WORDS_PER_SEGMENT = 3          # hard cap of 3 spoken words on screen
 
+# Build/version overlay
+CODE_VERSION = "2026-02-14.1"
+CAPTION_VERSION = os.getenv("CAPTION_VERSION", "").strip()
+CAPTION_VERSION_OVERLAY = os.getenv("CAPTION_VERSION_OVERLAY", "false").lower() in ("1", "true", "yes", "on")
+
 # Safe-zone configuration (percentages of width/height)
 SAFEZONE_TOP_PCT = float(os.getenv("SAFEZONE_TOP_PCT", "0.14"))
 SAFEZONE_BOTTOM_PCT = float(os.getenv("SAFEZONE_BOTTOM_PCT", "0.35"))
@@ -250,6 +255,27 @@ def _bbox_within_safezone(x: int, y: int, w: int, h: int, safe_rect) -> bool:
     left, top, right, bottom = safe_rect
     return x >= left and y >= top and (x + w) <= right and (y + h) <= bottom
 
+def _version_text() -> str:
+    if CAPTION_VERSION:
+        return f"code:{CODE_VERSION} env:{CAPTION_VERSION}"
+    return f"code:{CODE_VERSION}"
+
+def _render_version_overlay(video_w: int, video_h: int) -> Image.Image:
+    text = _version_text()
+    font_size = max(12, int(video_h * 0.02))
+    font = _load_font(font_size)
+    tmp = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), text, font=font, stroke_width=2)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    pad = max(4, int(font_size * 0.3))
+    img = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, img.width, img.height], radius=max(3, int(h * 0.4)), fill=(0, 0, 0, 140))
+    d.text((pad, pad), text, font=font, fill=(255, 255, 255, 220), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    return img
+
 def _render_caption_image_singleline(text: str, safe_width: int, base_fontsize: int, padding_px: int = 12):
     """
     Render ALL-CAPS text on a semi-transparent rounded rectangle background (single line).
@@ -304,6 +330,14 @@ def add_captions(video_path: Path, segments, output_path: Path):
         overlay = _safezone_debug_overlay(video.w, video.h)
         clips.append(
             ImageClip(np.array(overlay), transparent=True).set_duration(video.duration)
+        )
+    if CAPTION_VERSION_OVERLAY:
+        overlay = _render_version_overlay(video.w, video.h)
+        pad = max(10, int(video.h * 0.02))
+        clips.append(
+            ImageClip(np.array(overlay), transparent=True)
+            .set_duration(video.duration)
+            .set_position((pad, video.h - overlay.height - pad))
         )
 
     for start, end, txt in segments:

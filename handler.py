@@ -20,6 +20,11 @@ LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None  # optional, e.g. "en"
 SLACK_WEBHOOK_ENV = os.getenv("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.getenv("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
 
+# Build/version overlay
+CODE_VERSION = "2026-02-14.1"
+CAPTION_VERSION = os.getenv("CAPTION_VERSION", "").strip()
+CAPTION_VERSION_OVERLAY = os.getenv("CAPTION_VERSION_OVERLAY", "false").lower() in ("1","true","yes","on")
+
 # Choose backend: "fastwhisper" (default) or "openai" (uses caption.py)
 CAPTION_BACKEND = os.getenv("CAPTION_BACKEND", "fastwhisper").lower()
 
@@ -140,6 +145,25 @@ def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
                 _FONT_CACHE[key] = ImageFont.truetype(p, font_size)
             return _FONT_CACHE[key]
     return ImageFont.load_default()
+
+def _version_text() -> str:
+    if CAPTION_VERSION:
+        return f"code:{CODE_VERSION} env:{CAPTION_VERSION}"
+    return f"code:{CODE_VERSION}"
+
+def _escape_drawtext(text: str) -> str:
+    return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+def _version_overlay_filter(video_w: int, video_h: int) -> str:
+    text = _escape_drawtext(_version_text())
+    fontsize = max(12, int(video_h * 0.02))
+    fontfile = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    pad = max(10, int(video_h * 0.02))
+    return (
+        "drawtext="
+        f"fontfile={fontfile}:text='{text}':x={pad}:y=h-th-{pad}:"
+        f"fontsize={fontsize}:fontcolor=white@0.85:box=1:boxcolor=black@0.5:boxborderw=4"
+    )
 
 def _check_srt_safezone(srt_text: str, video_w: int, video_h: int, font_size: int):
     safe_left, safe_top, safe_right, safe_bottom = _safezone_rect(video_w, video_h)
@@ -286,6 +310,8 @@ def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: 
         flt = f"subtitles={srt_esc}:fontsdir={fonts_dir}"
     if SAFEZONE_DEBUG:
         flt = f"{flt},{_safezone_debug_filters(video_w, video_h)}"
+    if CAPTION_VERSION_OVERLAY:
+        flt = f"{flt},{_version_overlay_filter(video_w, video_h)}"
 
     if SAFEZONE_ENFORCE and (not sub_is_ass):
         try:
