@@ -228,6 +228,36 @@ def _fit_font_size_for_safezone(srt_text: str, video_w: int, video_h: int, start
         f"Safe-zone check failed even after auto-fit (min font {min_size}px): {last_err}"
     )
 
+def _maybe_chunkify_srt_text(srt_text: str) -> str:
+    if not srt_text.strip():
+        return srt_text
+    if MAX_WORDS_PER_CU <= 0 and MAX_CUE_DURATION <= 0:
+        return srt_text
+    awk = "/app/tools/srt_chunkify.awk"
+    if not os.path.exists(awk):
+        return srt_text
+    try:
+        in_fd, in_path = tempfile.mkstemp(prefix="captions_raw_", suffix=".srt"); os.close(in_fd)
+        out_fd, out_path = tempfile.mkstemp(prefix="captions_tuned_", suffix=".srt"); os.close(out_fd)
+        with open(in_path, "w", encoding="utf-8") as f:
+            f.write(srt_text)
+        cmd = ["awk", f"-vW={MAX_WORDS_PER_CU}", f"-vD={MAX_CUE_DURATION}", "-f", awk, in_path]
+        with open(out_path, "w", encoding="utf-8") as outf:
+            subprocess.run(cmd, check=True, stdout=outf)
+        tuned = open(out_path, "r", encoding="utf-8").read()
+        return tuned if tuned.strip() else srt_text
+    except Exception as e:
+        print("[CHUNKIFY] Skipped (no awk or error):", e)
+        return srt_text
+    finally:
+        try:
+            if "in_path" in locals() and os.path.exists(in_path):
+                os.unlink(in_path)
+            if "out_path" in locals() and os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+
 def _hex_to_ass_color(value: str) -> str:
     v = value.strip().lstrip("#")
     if len(v) != 6:
@@ -981,6 +1011,13 @@ def handler(event):
     if not srt_text or not srt_text.strip():
         raise RuntimeError("No captions generated (empty SRT). Check FastWhisper output or input SRT.")
 
+    chunkified = False
+    if not srt_from_words:
+        tuned = _maybe_chunkify_srt_text(srt_text)
+        if tuned.strip() and tuned != srt_text:
+            srt_text = tuned
+            chunkified = True
+
     if SAFEZONE_ENFORCE or (WORD_HIGHLIGHT and cues):
         video_w, video_h = _probe_video_size(vid_local)
         base_font = max(18, int(video_h * FONT_SIZE_PCT))
@@ -1021,7 +1058,7 @@ def handler(event):
         cue_count = 0
     _slack_post(
         f"[facebook-caption] job={job_id} srt_used={srt_used} cues={cue_count} words={word_count} "
-        f"word_srt={'yes' if srt_from_words else 'no'}",
+        f"word_srt={'yes' if srt_from_words else 'no'} chunkified={'yes' if chunkified else 'no'}",
         force=True
     )
 
@@ -1080,18 +1117,7 @@ def handler(event):
     up_srt = _upload_tmp_to_s3(srt_local, srt_key, content_type="application/x-subrip")
     result = {"srt_key": up_srt["key"], "srt_url": up_srt["url"]}
 
-    # Optional: chunkify SRT (if AWK tool is present in the image)
-    try:
-        if not srt_from_words and (MAX_WORDS_PER_CU > 0 or MAX_CUE_DURATION > 0):
-            tmp_fd, tuned_srt = tempfile.mkstemp(prefix="captions_tuned_", suffix=".srt"); os.close(tmp_fd)
-            awk = "/app/tools/srt_chunkify.awk"
-            cmd = ["awk", f"-vW={MAX_WORDS_PER_CU}", f"-vD={MAX_CUE_DURATION}", "-f", awk, srt_local]
-            with open(tuned_srt, "w", encoding="utf-8") as outf:
-                subprocess.run(cmd, check=True, stdout=outf)
-            srt_local = tuned_srt
-            srt_text = open(srt_local,"r",encoding="utf-8").read()
-    except Exception as _e:
-        print("[CHUNKIFY] Skipped (no awk or error):", _e)
+    # Chunkify already applied (if enabled) before safezone/burn.
 
     if not burn:
         return result
