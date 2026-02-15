@@ -182,19 +182,31 @@ def _check_srt_safezone(srt_text: str, video_w: int, video_h: int, font_size: in
     font = _load_font(font_size)
     img = Image.new("RGBA", (1, 1))
     draw = ImageDraw.Draw(img)
-    for _, _, text in _parse_srt_blocks(srt_text):
+    for idx, (start, end, text) in enumerate(_parse_srt_blocks(srt_text), 1):
         if not text:
             continue
         bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center", spacing=2, stroke_width=2)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
         if text_h > (safe_bottom - safe_top):
-            raise RuntimeError("Caption height exceeds safe-zone height; reduce font size.")
+            snippet = text.strip().replace("\n", " ")
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "..."
+            raise RuntimeError(
+                "Caption height exceeds safe-zone height; reduce font size. "
+                f"cue={idx} time={start:.2f}-{end:.2f} text={snippet!r}"
+            )
         x = int((video_w - text_w) / 2)
         bottom = safe_bottom - safe_pad
         y = int(bottom - text_h)
         if x < safe_left or (x + text_w) > safe_right or y < safe_top or (y + text_h) > safe_bottom:
-            raise RuntimeError("Caption bbox intersects safe-zone no-go areas.")
+            snippet = text.strip().replace("\n", " ")
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "..."
+            raise RuntimeError(
+                "Caption bbox intersects safe-zone no-go areas. "
+                f"cue={idx} time={start:.2f}-{end:.2f} text={snippet!r}"
+            )
 
 def _fit_font_size_for_safezone(srt_text: str, video_w: int, video_h: int, start_size: int) -> int:
     if not SAFEZONE_ENFORCE:
