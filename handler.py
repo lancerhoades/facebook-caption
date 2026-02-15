@@ -499,6 +499,13 @@ def _fastwh_extract_words(data):
     """
     Extract word-level timestamps from FastWhisper-style responses.
     """
+    def pull_words_from_list(items):
+        words = []
+        for w in items or []:
+            if isinstance(w, dict) and {"start", "end", "word"} <= set(w.keys()):
+                words.append({"start": w["start"], "end": w["end"], "word": w["word"]})
+        return words
+
     def pull_words_from_segments(segs):
         words = []
         for s in segs or []:
@@ -512,10 +519,18 @@ def _fastwh_extract_words(data):
         words = pull_words_from_segments(out["segments"])
         if words:
             return words
+    if isinstance(out, dict) and isinstance(out.get("word_timestamps"), list):
+        words = pull_words_from_list(out.get("word_timestamps"))
+        if words:
+            return words
     if isinstance(out, list) and out:
         first = out[0]
         if isinstance(first, dict) and isinstance(first.get("segments"), list):
             words = pull_words_from_segments(first["segments"])
+            if words:
+                return words
+        if isinstance(first, dict) and isinstance(first.get("word_timestamps"), list):
+            words = pull_words_from_list(first.get("word_timestamps"))
             if words:
                 return words
 
@@ -523,9 +538,17 @@ def _fastwh_extract_words(data):
         words = pull_words_from_segments(data["segments"])
         if words:
             return words
+    if isinstance(data.get("word_timestamps"), list):
+        words = pull_words_from_list(data.get("word_timestamps"))
+        if words:
+            return words
     nest = data.get("data")
     if isinstance(nest, dict) and isinstance(nest.get("segments"), list):
         words = pull_words_from_segments(nest["segments"])
+        if words:
+            return words
+    if isinstance(nest, dict) and isinstance(nest.get("word_timestamps"), list):
+        words = pull_words_from_list(nest.get("word_timestamps"))
         if words:
             return words
 
