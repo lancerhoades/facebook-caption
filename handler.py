@@ -828,6 +828,15 @@ def handler(event):
     if not video_url:
         raise RuntimeError("video_url is required")
 
+    video_path = urllib.parse.urlparse(video_url).path or ""
+    if "/captions/" in video_path:
+        warn = (
+            f"[facebook-caption] job={job_id} WARNING: video_url points at /captions/ "
+            "output; use a raw reel/clip to avoid double-captioning."
+        )
+        print(warn)
+        _slack_post(warn, force=True)
+
     raw_source = "none"
     if srt_text_in:
         raw_source = "srt_text"
@@ -840,6 +849,8 @@ def handler(event):
         f"job={job_id} backend={CAPTION_BACKEND} "
         f"highlight={'on' if WORD_HIGHLIGHT else 'off'} "
         f"force_fastwh={'on' if CAPTION_FORCE_FASTWH else 'off'} "
+        f"word_ts={'on' if FASTWH_WORDTS else 'off'} "
+        f"vad={'on' if FASTWH_VAD else 'off'} "
         f"safezone={'enforce' if SAFEZONE_ENFORCE else 'off'} "
         f"burn={'on' if burn else 'off'} "
         f"srt_source={raw_source} "
@@ -887,6 +898,8 @@ def handler(event):
     ass_local = None
     srt_text = None
     srt_from_words = False
+    srt_used = "none"
+    word_count = 0
     force_fastwh = CAPTION_FORCE_FASTWH or WORD_HIGHLIGHT
     if force_fastwh and (srt_text_in or srt_url_in or srt_key_in):
         print("[CAPTION] Ignoring provided SRT due to force_fastwh/word_highlight.")
@@ -895,20 +908,25 @@ def handler(event):
         srt_key_in = None
     if srt_text_in:
         srt_text = srt_text_in
+        srt_used = "srt_text"
     elif srt_url_in:
         with urllib.request.urlopen(srt_url_in) as r:
             _raw = r.read().decode("utf-8", "ignore")
             srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
+        srt_used = "srt_url"
     elif srt_key_in:
         obj = s3.get_object(Bucket=AWS_S3_BUCKET, Key=srt_key_in)
         _raw = obj["Body"].read().decode("utf-8", "ignore")
         srt_text = _vtt_to_srt(_raw) if _raw.lstrip().startswith("WEBVTT") else _raw
+        srt_used = "srt_key"
     else:
         srt_text, fw_data = _fastwh_to_srt(video_url, return_data=True)
         words = _fastwh_extract_words(fw_data)
+        word_count = len(words)
         _apply_capitalization_to_words(words)
         if WORD_HIGHLIGHT and (not words) and WORD_HIGHLIGHT_APPROX and srt_text:
             words = _approx_words_from_srt_blocks(srt_text)
+            word_count = len(words)
             _apply_capitalization_to_words(words)
             if words:
                 print(f"[FASTWH] approximated word timings from SRT words={len(words)}")
@@ -936,6 +954,21 @@ def handler(event):
                     print("[FASTWH] built ASS karaoke captions")
                 except Exception as e:
                     print("[FASTWH] failed to build ASS karaoke, falling back:", e)
+        srt_used = "fastwh"
+
+    if not srt_text or not srt_text.strip():
+        raise RuntimeError("No captions generated (empty SRT). Check FastWhisper output or input SRT.")
+
+    cue_count = 0
+    try:
+        cue_count = len(list(_parse_srt_blocks(srt_text)))
+    except Exception:
+        cue_count = 0
+    _slack_post(
+        f"[facebook-caption] job={job_id} srt_used={srt_used} cues={cue_count} words={word_count} "
+        f"word_srt={'yes' if srt_from_words else 'no'}",
+        force=True
+    )
 
     srt_fd, srt_local = tempfile.mkstemp(prefix="captions_", suffix=".srt"); os.close(srt_fd)
     with open(srt_local, "w", encoding="utf-8") as f:
