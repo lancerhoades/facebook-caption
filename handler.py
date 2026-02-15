@@ -41,6 +41,8 @@ SAFEZONE_SIDE_PCT = float(os.getenv("SAFEZONE_SIDE_PCT", "0.06"))
 SAFEZONE_PAD_PCT = float(os.getenv("SAFEZONE_PAD_PCT", "0.02"))
 SAFEZONE_DEBUG = os.getenv("SAFEZONE_DEBUG", "false").lower() in ("1","true","yes","on")
 SAFEZONE_ENFORCE = os.getenv("SAFEZONE_ENFORCE", "true").lower() in ("1","true","yes","on")
+SAFEZONE_AUTOFIT = os.getenv("SAFEZONE_AUTOFIT", "true").lower() in ("1","true","yes","on")
+SAFEZONE_MIN_FONT_PCT = float(os.getenv("SAFEZONE_MIN_FONT_PCT", "0.035"))
 FONT_SIZE_PCT = float(os.getenv("FONT_SIZE_PCT", "0.05"))
 CAPTION_FORCE_FASTWH = os.getenv("CAPTION_FORCE_FASTWHISPER", "false").lower() in ("1","true","yes","on")
 WORD_HIGHLIGHT = os.getenv("WORD_HIGHLIGHT", "false").lower() in ("1","true","yes","on")
@@ -194,6 +196,26 @@ def _check_srt_safezone(srt_text: str, video_w: int, video_h: int, font_size: in
         if x < safe_left or (x + text_w) > safe_right or y < safe_top or (y + text_h) > safe_bottom:
             raise RuntimeError("Caption bbox intersects safe-zone no-go areas.")
 
+def _fit_font_size_for_safezone(srt_text: str, video_w: int, video_h: int, start_size: int) -> int:
+    if not SAFEZONE_ENFORCE:
+        return start_size
+    min_size = max(18, int(video_h * SAFEZONE_MIN_FONT_PCT))
+    if not SAFEZONE_AUTOFIT:
+        _check_srt_safezone(srt_text, video_w, video_h, start_size)
+        return start_size
+    size = start_size
+    last_err = None
+    while size >= min_size:
+        try:
+            _check_srt_safezone(srt_text, video_w, video_h, size)
+            return size
+        except Exception as e:
+            last_err = e
+            size -= 2
+    raise RuntimeError(
+        f"Safe-zone check failed even after auto-fit (min font {min_size}px): {last_err}"
+    )
+
 def _hex_to_ass_color(value: str) -> str:
     v = value.strip().lstrip("#")
     if len(v) != 6:
@@ -295,10 +317,10 @@ def _write_single_block_srt(path: str, duration_s: float, text: str):
 
 def _burn_captions_ffmpeg(video_path: str, srt_path: str, out_path: str, style: str | None,
                           start_s: float | None = None, end_s: float | None = None,
-                          sub_is_ass: bool = False):
+                          sub_is_ass: bool = False, font_size_override: int | None = None):
     fonts_dir = "/usr/local/share/fonts/custom"
     video_w, video_h = _probe_video_size(video_path)
-    font_size = max(18, int(video_h * FONT_SIZE_PCT))
+    font_size = font_size_override or max(18, int(video_h * FONT_SIZE_PCT))
     margin_lr = int(video_w * SAFEZONE_SIDE_PCT)
     margin_v = int(video_h * SAFEZONE_BOTTOM_PCT) + int(video_h * SAFEZONE_PAD_PCT)
     enforced_style = (
@@ -898,8 +920,12 @@ def handler(event):
     ass_local = None
     srt_text = None
     srt_from_words = False
+    cues = None
     srt_used = "none"
     word_count = 0
+    font_size_override = None
+    video_w = None
+    video_h = None
     force_fastwh = CAPTION_FORCE_FASTWH or WORD_HIGHLIGHT
     if force_fastwh and (srt_text_in or srt_url_in or srt_key_in):
         print("[CAPTION] Ignoring provided SRT due to force_fastwh/word_highlight.")
@@ -938,26 +964,43 @@ def handler(event):
                 srt_text = word_srt
                 srt_from_words = True
                 print(f"[FASTWH] built word-based SRT words={len(words)} max_words={max_words} max_dur={MAX_CUE_DURATION}")
-            if WORD_HIGHLIGHT and cues:
-                try:
-                    video_w, video_h = _probe_video_size(vid_local)
-                    font_size = max(18, int(video_h * FONT_SIZE_PCT))
-                    margin_lr = int(video_w * SAFEZONE_SIDE_PCT)
-                    margin_v = int(video_h * SAFEZONE_BOTTOM_PCT) + int(video_h * SAFEZONE_PAD_PCT)
-                    ass_text = _cues_to_ass_karaoke(
-                        cues, video_w, video_h, font_size, margin_lr, margin_v,
-                        WORD_HIGHLIGHT_COLOR, WORD_INACTIVE_COLOR
-                    )
-                    ass_fd, ass_local = tempfile.mkstemp(prefix="captions_", suffix=".ass"); os.close(ass_fd)
-                    with open(ass_local, "w", encoding="utf-8") as f:
-                        f.write(ass_text)
-                    print("[FASTWH] built ASS karaoke captions")
-                except Exception as e:
-                    print("[FASTWH] failed to build ASS karaoke, falling back:", e)
         srt_used = "fastwh"
 
     if not srt_text or not srt_text.strip():
         raise RuntimeError("No captions generated (empty SRT). Check FastWhisper output or input SRT.")
+
+    if SAFEZONE_ENFORCE or (WORD_HIGHLIGHT and cues):
+        video_w, video_h = _probe_video_size(vid_local)
+        base_font = max(18, int(video_h * FONT_SIZE_PCT))
+        if SAFEZONE_ENFORCE:
+            font_size_override = _fit_font_size_for_safezone(srt_text, video_w, video_h, base_font)
+            if font_size_override != base_font:
+                msg = (
+                    f"[facebook-caption] job={job_id} safezone_autofit font_px={font_size_override} "
+                    f"(base {base_font}px)"
+                )
+                print(msg)
+                _slack_post(msg, force=True)
+        else:
+            font_size_override = base_font
+
+    if WORD_HIGHLIGHT and cues:
+        try:
+            if video_w is None or video_h is None:
+                video_w, video_h = _probe_video_size(vid_local)
+            font_size = font_size_override or max(18, int(video_h * FONT_SIZE_PCT))
+            margin_lr = int(video_w * SAFEZONE_SIDE_PCT)
+            margin_v = int(video_h * SAFEZONE_BOTTOM_PCT) + int(video_h * SAFEZONE_PAD_PCT)
+            ass_text = _cues_to_ass_karaoke(
+                cues, video_w, video_h, font_size, margin_lr, margin_v,
+                WORD_HIGHLIGHT_COLOR, WORD_INACTIVE_COLOR
+            )
+            ass_fd, ass_local = tempfile.mkstemp(prefix="captions_", suffix=".ass"); os.close(ass_fd)
+            with open(ass_local, "w", encoding="utf-8") as f:
+                f.write(ass_text)
+            print("[FASTWH] built ASS karaoke captions")
+        except Exception as e:
+            print("[FASTWH] failed to build ASS karaoke, falling back:", e)
 
     cue_count = 0
     try:
@@ -1049,15 +1092,16 @@ def handler(event):
         out_fd, out_local = tempfile.mkstemp(prefix="captioned_", suffix=".mp4"); os.close(out_fd)
         if ass_local:
             if SAFEZONE_ENFORCE:
-                video_w, video_h = _probe_video_size(vid_local)
-                font_size = max(18, int(video_h * FONT_SIZE_PCT))
+                if video_w is None or video_h is None:
+                    video_w, video_h = _probe_video_size(vid_local)
+                font_size = font_size_override or max(18, int(video_h * FONT_SIZE_PCT))
                 if not srt_text:
                     with open(srt_local, "r", encoding="utf-8") as f:
                         srt_text = f.read()
                 _check_srt_safezone(srt_text, video_w, video_h, font_size)
-            _burn_captions_ffmpeg(vid_local, ass_local, out_local, style, sub_is_ass=True)
+            _burn_captions_ffmpeg(vid_local, ass_local, out_local, style, sub_is_ass=True, font_size_override=font_size_override)
         else:
-            _burn_captions_ffmpeg(vid_local, srt_local, out_local, style)
+            _burn_captions_ffmpeg(vid_local, srt_local, out_local, style, font_size_override=font_size_override)
         cap_key = inp.get("output_video_key") or _key(job_id, "captions", f"{base}.mp4")
         up_cap = _upload_tmp_to_s3(out_local, cap_key, content_type="video/mp4")
         result.update({"captioned_key": up_cap["key"], "captioned_url": up_cap["url"]})
