@@ -16,6 +16,7 @@ RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 FASTWH_ID      = os.getenv("RUNPOD_FASTWHISPER_ENDPOINT_ID")
 FASTWH_VAD     = os.getenv("FASTWH_ENABLE_VAD", "true").lower() in ("1","true","yes","on")
 FASTWH_WORDTS  = os.getenv("FASTWH_WORD_TIMESTAMPS", "true").lower() in ("1","true","yes","on")
+FASTWH_TRANSCRIPTION = os.getenv("FASTWH_TRANSCRIPTION", "srt").strip().lower() or "srt"
 LANG_HINT      = os.getenv("TRANSCRIBE_LANG") or None  # optional, e.g. "en"
 SLACK_WEBHOOK_ENV = os.getenv("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.getenv("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
@@ -770,11 +771,16 @@ def _fastwh_to_srt(video_url: str, *, return_data: bool = False) -> str | tuple[
         r.raise_for_status()
         return r.json()
 
+    transcription = FASTWH_TRANSCRIPTION
+    if FASTWH_WORDTS:
+        # Use a non-SRT transcription to ensure word timestamps are returned.
+        transcription = "plain_text"
+
     payload = {
         "input": {
             "audio": video_url,
             "model": "large-v3",
-            "transcription": "srt",
+            "transcription": transcription,
             "enable_vad": FASTWH_VAD,
             "word_timestamps": FASTWH_WORDTS,
         }
@@ -908,12 +914,14 @@ def handler(event):
         raw_source = "srt_url"
     elif srt_key_in:
         raw_source = "srt_key"
+    transcription_mode = "plain_text" if FASTWH_WORDTS else FASTWH_TRANSCRIPTION
     _slack_post(
         "[facebook-caption] "
         f"job={job_id} backend={CAPTION_BACKEND} "
         f"highlight={'on' if WORD_HIGHLIGHT else 'off'} "
         f"force_fastwh={'on' if CAPTION_FORCE_FASTWH else 'off'} "
         f"word_ts={'on' if FASTWH_WORDTS else 'off'} "
+        f"transcription={transcription_mode} "
         f"vad={'on' if FASTWH_VAD else 'off'} "
         f"safezone={'enforce' if SAFEZONE_ENFORCE else 'off'} "
         f"burn={'on' if burn else 'off'} "
@@ -992,6 +1000,8 @@ def handler(event):
         words = _fastwh_extract_words(fw_data)
         word_count = len(words)
         _apply_capitalization_to_words(words)
+        if FASTWH_WORDTS and not words:
+            raise RuntimeError("FastWhisper did not return word timestamps; cannot build 1-3 word cues.")
         if WORD_HIGHLIGHT and (not words) and WORD_HIGHLIGHT_APPROX and srt_text:
             words = _approx_words_from_srt_blocks(srt_text)
             word_count = len(words)
